@@ -42,7 +42,7 @@ def init(dsn: str, *, capture_body: bool = True,
     Initialize CostKey. Call once at app startup.
 
     >>> import costkey
-    >>> costkey.init(dsn="https://ck_abc123@costkey.dev/my-project")
+    >>> costkey.init(dsn="https://ck_abc123@app.costkey.dev/my-project")
     >>> # That's it. Every AI call is now tracked.
     """
     global _transport, _initialized

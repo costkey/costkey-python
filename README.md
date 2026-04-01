@@ -13,7 +13,7 @@ pip install costkey
 ```python
 import costkey
 
-costkey.init(dsn="https://ck_your_key@costkey.dev/your-project")
+costkey.init(dsn="https://ck_your_key@app.costkey.dev/your-project")
 
 # That's it. Every AI call is now tracked automatically.
 # Works with OpenAI, Anthropic, Google Gemini, Azure OpenAI.
@@ -104,7 +104,7 @@ npm install costkey
 
 ```typescript
 import { CostKey } from 'costkey'
-CostKey.init({ dsn: 'https://ck_...@costkey.dev/proj' })
+CostKey.init({ dsn: 'https://ck_...@app.costkey.dev/proj' })
 ```
 
 ## License
