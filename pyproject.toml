@@ -1,0 +1,34 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "costkey"
+version = "0.1.0"
+description = "Sentry for AI costs. Track every LLM call's cost, tokens, and latency with one line of code."
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.9"
+authors = [{ name = "CostKey", email = "hello@costkey.dev" }]
+keywords = ["ai", "llm", "cost", "tracking", "observability", "openai", "anthropic", "gemini"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Topic :: Software Engineering",
+]
+dependencies = [
+    "httpx>=0.24.0",
+]
+
+[project.urls]
+Homepage = "https://costkey.dev"
+Repository = "https://github.com/costkey/costkey-python"
+Documentation = "https://github.com/costkey/costkey-python"
+
+[tool.hatch.build.targets.wheel]
+packages = ["costkey"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
