@@ -1,4 +1,4 @@
-"""CostKey Python SDK — Sentry for AI costs."""
+"""CostKey Python SDK — AI cost observability."""
 from __future__ import annotations
 import uuid
 import logging
