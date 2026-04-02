@@ -5,8 +5,9 @@ import time
 import uuid
 import re
 import logging
+import functools
 from contextvars import ContextVar
-from typing import Any, Callable
+from typing import Any, Callable, Iterator, AsyncIterator
 from costkey.types import CostKeyEvent, NormalizedUsage, StreamTiming, Provider
 from costkey.providers import find_extractor
 from costkey.stack import capture_call_site
@@ -14,10 +15,8 @@ from costkey.transport import Transport
 
 logger = logging.getLogger("costkey")
 
-# Context var for tracing / manual context
 _context: ContextVar[dict[str, Any]] = ContextVar("costkey_context", default={})
 
-# Secret patterns to scrub from bodies
 _SECRET_PATTERNS = [
     re.compile(r"^sk-[a-zA-Z0-9]{20,}$"),
     re.compile(r"^sk-ant-[a-zA-Z0-9\-]{20,}$"),
@@ -71,14 +70,12 @@ def patch(transport: Transport, project_id: str, capture_body: bool,
           before_send: Callable | None, default_context: dict[str, Any], debug: bool) -> None:
     if _state.patched:
         return
-
     _state.transport = transport
     _state.project_id = project_id
     _state.capture_body = capture_body
     _state.before_send = before_send
     _state.default_context = default_context
     _state.debug = debug
-
     _patch_httpx()
     _patch_requests()
     _state.patched = True
@@ -91,14 +88,12 @@ def unpatch() -> None:
 
 
 def _is_streaming_request(request_body: Any) -> bool:
-    """Check if the request body has stream: true."""
     if isinstance(request_body, dict):
         return request_body.get("stream") is True
     return False
 
 
 def _extract_sse_usage(text: str, extractor: Any) -> NormalizedUsage | None:
-    """Extract usage from accumulated SSE text — scan from the end for the final data chunk."""
     lines = text.split("\n")
     for i in range(len(lines) - 1, -1, -1):
         line = lines[i]
@@ -118,7 +113,6 @@ def _extract_sse_usage(text: str, extractor: Any) -> NormalizedUsage | None:
 
 
 def _extract_sse_model(text: str, request_body: Any, extractor: Any) -> str | None:
-    """Extract model name from SSE text."""
     for line in text.split("\n"):
         if not line.startswith("data: "):
             continue
@@ -134,6 +128,8 @@ def _extract_sse_model(text: str, request_body: Any, extractor: Any) -> str | No
             continue
     return None
 
+
+# ── httpx patching ──
 
 def _patch_httpx() -> None:
     try:
@@ -159,29 +155,24 @@ def _patch_httpx() -> None:
                 except Exception:
                     pass
 
-            is_streaming = _is_streaming_request(request_body)
-
-            # Force stream=True in kwargs so we can intercept the response stream
-            if is_streaming:
-                kwargs.setdefault("stream", True)
+            is_streaming = _is_streaming_request(request_body) or kwargs.get("stream", False)
 
             response = _state._original_httpx_send(self, request, **kwargs)
 
-            if is_streaming and hasattr(response, "stream"):
-                # Streaming response — wrap the stream to capture timing + usage
-                _handle_streaming_response(
+            if is_streaming:
+                # Wrap the response's iteration methods to capture streaming data
+                _wrap_streaming_response(
                     response, extractor, url, request.method,
                     request_body, start, call_site, ctx,
                 )
             else:
-                # Non-streaming — read response body
+                # Non-streaming — read body normally
                 duration_ms = (time.perf_counter() - start) * 1000
                 response_body = None
                 try:
                     response_body = response.json()
                 except Exception:
                     pass
-
                 _process(extractor, url, request.method, response.status_code,
                          request_body, response_body, duration_ms,
                          False, None, call_site, ctx)
@@ -211,15 +202,12 @@ def _patch_httpx() -> None:
                 except Exception:
                     pass
 
-            is_streaming = _is_streaming_request(request_body)
-
-            if is_streaming:
-                kwargs.setdefault("stream", True)
+            is_streaming = _is_streaming_request(request_body) or kwargs.get("stream", False)
 
             response = await _state._original_httpx_async_send(self, request, **kwargs)
 
-            if is_streaming and hasattr(response, "stream"):
-                _handle_streaming_response(
+            if is_streaming:
+                _wrap_streaming_response(
                     response, extractor, url, request.method,
                     request_body, start, call_site, ctx,
                 )
@@ -230,7 +218,6 @@ def _patch_httpx() -> None:
                     response_body = response.json()
                 except Exception:
                     pass
-
                 _process(extractor, url, request.method, response.status_code,
                          request_body, response_body, duration_ms,
                          False, None, call_site, ctx)
@@ -244,112 +231,176 @@ def _patch_httpx() -> None:
             logger.debug("[costkey] httpx not installed, skipping patch")
 
 
-def _handle_streaming_response(
+def _wrap_streaming_response(
     response: Any, extractor: Any, url: str, method: str,
     request_body: Any, start: float,
     call_site: Any, ctx: dict[str, Any],
 ) -> None:
-    """Hook into httpx streaming response to capture TTFT, TPS, and usage."""
-    original_iter = response.stream.__class__.__iter__
-    original_aiter = getattr(response.stream.__class__, "__aiter__", None)
+    """
+    Wrap httpx Response iteration methods to capture streaming data.
 
+    The Anthropic/OpenAI SDKs use response.iter_lines() or response.iter_bytes()
+    to consume SSE streams. We wrap these methods to accumulate the text,
+    then extract usage + timing when iteration finishes.
+    """
     accumulated_text = ""
     first_chunk_time: float | None = None
     chunk_count = 0
     event_sent = False
 
-    class StreamWrapper:
-        """Wraps the httpx stream to intercept chunks without buffering."""
-        def __init__(self, original_stream: Any) -> None:
-            self._stream = original_stream
+    def _on_chunk(chunk_bytes: bytes) -> None:
+        nonlocal accumulated_text, first_chunk_time, chunk_count
+        chunk_count += 1
+        if first_chunk_time is None:
+            first_chunk_time = time.perf_counter()
+        try:
+            accumulated_text += chunk_bytes.decode("utf-8", errors="replace")
+        except Exception:
+            pass
 
-        def __iter__(self) -> Any:
-            nonlocal accumulated_text, first_chunk_time, chunk_count, event_sent
+    def _on_done() -> None:
+        nonlocal event_sent
+        if event_sent:
+            return
+        event_sent = True
+
+        end = time.perf_counter()
+        duration_ms = (end - start) * 1000
+
+        usage = _extract_sse_usage(accumulated_text, extractor)
+        model = _extract_sse_model(accumulated_text, request_body, extractor)
+
+        ttft = ((first_chunk_time - start) * 1000) if first_chunk_time else None
+        tps = None
+        if usage and usage.output_tokens and first_chunk_time:
+            stream_secs = end - first_chunk_time
+            if stream_secs > 0:
+                tps = usage.output_tokens / stream_secs
+
+        stream_timing = StreamTiming(
+            ttft=round(ttft, 2) if ttft else None,
+            tps=round(tps, 2) if tps else None,
+            stream_duration=round(duration_ms, 2),
+            chunk_count=chunk_count,
+        )
+
+        _process(extractor, url, method, response.status_code,
+                 request_body, None, duration_ms,
+                 True, stream_timing, call_site, ctx)
+
+    # Wrap iter_bytes
+    original_iter_bytes = response.iter_bytes
+
+    @functools.wraps(original_iter_bytes)
+    def wrapped_iter_bytes(*a: Any, **kw: Any) -> Iterator[bytes]:
+        try:
+            for chunk in original_iter_bytes(*a, **kw):
+                _on_chunk(chunk)
+                yield chunk
+        finally:
+            _on_done()
+
+    response.iter_bytes = wrapped_iter_bytes
+
+    # Wrap iter_lines
+    original_iter_lines = response.iter_lines
+
+    @functools.wraps(original_iter_lines)
+    def wrapped_iter_lines(*a: Any, **kw: Any) -> Iterator[str]:
+        try:
+            for line in original_iter_lines(*a, **kw):
+                _on_chunk(line.encode("utf-8") if isinstance(line, str) else line)
+                yield line
+        finally:
+            _on_done()
+
+    response.iter_lines = wrapped_iter_lines
+
+    # Wrap iter_text
+    if hasattr(response, "iter_text"):
+        original_iter_text = response.iter_text
+
+        @functools.wraps(original_iter_text)
+        def wrapped_iter_text(*a: Any, **kw: Any) -> Iterator[str]:
             try:
-                for chunk in self._stream:
-                    chunk_count += 1
-                    if first_chunk_time is None:
-                        first_chunk_time = time.perf_counter()
-                    if isinstance(chunk, bytes):
-                        accumulated_text += chunk.decode("utf-8", errors="replace")
-                    else:
-                        accumulated_text += str(chunk)
+                for text in original_iter_text(*a, **kw):
+                    _on_chunk(text.encode("utf-8") if isinstance(text, str) else text)
+                    yield text
+            finally:
+                _on_done()
+
+        response.iter_text = wrapped_iter_text
+
+    # Wrap iter_raw
+    if hasattr(response, "iter_raw"):
+        original_iter_raw = response.iter_raw
+
+        @functools.wraps(original_iter_raw)
+        def wrapped_iter_raw(*a: Any, **kw: Any) -> Iterator[bytes]:
+            try:
+                for chunk in original_iter_raw(*a, **kw):
+                    _on_chunk(chunk)
                     yield chunk
             finally:
-                if not event_sent:
-                    event_sent = True
-                    _finalize_stream(
-                        extractor, url, method, response.status_code,
-                        request_body, accumulated_text,
-                        start, first_chunk_time, chunk_count,
-                        call_site, ctx,
-                    )
+                _on_done()
 
-        async def __aiter__(self) -> Any:
-            nonlocal accumulated_text, first_chunk_time, chunk_count, event_sent
+        response.iter_raw = wrapped_iter_raw
+
+    # Wrap read() for cases where the body is read all at once
+    original_read = response.read
+
+    @functools.wraps(original_read)
+    def wrapped_read(*a: Any, **kw: Any) -> bytes:
+        data = original_read(*a, **kw)
+        _on_chunk(data)
+        _on_done()
+        return data
+
+    response.read = wrapped_read
+
+    # Wrap async variants if they exist
+    if hasattr(response, "aiter_bytes"):
+        original_aiter_bytes = response.aiter_bytes
+
+        @functools.wraps(original_aiter_bytes)
+        async def wrapped_aiter_bytes(*a: Any, **kw: Any) -> AsyncIterator[bytes]:
             try:
-                async for chunk in self._stream:
-                    chunk_count += 1
-                    if first_chunk_time is None:
-                        first_chunk_time = time.perf_counter()
-                    if isinstance(chunk, bytes):
-                        accumulated_text += chunk.decode("utf-8", errors="replace")
-                    else:
-                        accumulated_text += str(chunk)
+                async for chunk in original_aiter_bytes(*a, **kw):
+                    _on_chunk(chunk)
                     yield chunk
             finally:
-                if not event_sent:
-                    event_sent = True
-                    _finalize_stream(
-                        extractor, url, method, response.status_code,
-                        request_body, accumulated_text,
-                        start, first_chunk_time, chunk_count,
-                        call_site, ctx,
-                    )
+                _on_done()
 
-        def close(self) -> None:
-            if hasattr(self._stream, "close"):
-                self._stream.close()
+        response.aiter_bytes = wrapped_aiter_bytes
 
-        async def aclose(self) -> None:
-            if hasattr(self._stream, "aclose"):
-                await self._stream.aclose()
+    if hasattr(response, "aiter_lines"):
+        original_aiter_lines = response.aiter_lines
 
-    # Replace the stream object
-    response.stream = StreamWrapper(response.stream)
+        @functools.wraps(original_aiter_lines)
+        async def wrapped_aiter_lines(*a: Any, **kw: Any) -> AsyncIterator[str]:
+            try:
+                async for line in original_aiter_lines(*a, **kw):
+                    _on_chunk(line.encode("utf-8") if isinstance(line, str) else line)
+                    yield line
+            finally:
+                _on_done()
+
+        response.aiter_lines = wrapped_aiter_lines
+
+    if hasattr(response, "aread"):
+        original_aread = response.aread
+
+        @functools.wraps(original_aread)
+        async def wrapped_aread(*a: Any, **kw: Any) -> bytes:
+            data = await original_aread(*a, **kw)
+            _on_chunk(data)
+            _on_done()
+            return data
+
+        response.aread = wrapped_aread
 
 
-def _finalize_stream(
-    extractor: Any, url: str, method: str, status_code: int | None,
-    request_body: Any, accumulated_text: str,
-    start: float, first_chunk_time: float | None, chunk_count: int,
-    call_site: Any, ctx: dict[str, Any],
-) -> None:
-    """Called when the stream ends — extract usage, compute timing, send event."""
-    end = time.perf_counter()
-    duration_ms = (end - start) * 1000
-
-    usage = _extract_sse_usage(accumulated_text, extractor)
-    model = _extract_sse_model(accumulated_text, request_body, extractor)
-
-    ttft = ((first_chunk_time - start) * 1000) if first_chunk_time else None
-    tps = None
-    if usage and usage.output_tokens and first_chunk_time:
-        stream_secs = end - first_chunk_time
-        if stream_secs > 0:
-            tps = usage.output_tokens / stream_secs
-
-    stream_timing = StreamTiming(
-        ttft=round(ttft, 2) if ttft else None,
-        tps=round(tps, 2) if tps else None,
-        stream_duration=round(duration_ms, 2),
-        chunk_count=chunk_count,
-    )
-
-    _process(extractor, url, method, status_code,
-             request_body, None, duration_ms,
-             True, stream_timing, call_site, ctx)
-
+# ── requests patching ──
 
 def _unpatch_httpx() -> None:
     try:
@@ -416,6 +467,8 @@ def _unpatch_requests() -> None:
         pass
 
 
+# ── Event processing ──
+
 def _process(extractor: Any, url: str, method: str, status_code: int | None,
              request_body: Any, response_body: Any,
              duration_ms: float, streaming: bool, stream_timing: StreamTiming | None,
@@ -423,10 +476,6 @@ def _process(extractor: Any, url: str, method: str, status_code: int | None,
     try:
         usage = extractor.extract_usage(response_body) if response_body else None
         model = extractor.extract_model(request_body, response_body)
-
-        # For streaming, usage comes from the stream finalizer, not response_body
-        if streaming and stream_timing and not usage:
-            usage = None  # Already handled in _finalize_stream
 
         event = CostKeyEvent(
             id=uuid.uuid4().hex,

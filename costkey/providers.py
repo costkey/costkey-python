@@ -112,7 +112,7 @@ def _make_simple_extractor(hostname: str, prov: Provider = Provider.UNKNOWN):
 
 
 class DeepSeekExtractor:
-    provider = Provider.UNKNOWN
+    provider = Provider.DEEPSEEK
     def match(self, url: str) -> bool:
         return (urlparse(url).hostname or "") == "api.deepseek.com"
     def extract_usage(self, body: Any) -> NormalizedUsage | None:
@@ -130,7 +130,7 @@ class DeepSeekExtractor:
 
 
 class BedrockExtractor:
-    provider = Provider.UNKNOWN
+    provider = Provider.BEDROCK
     def match(self, url: str) -> bool:
         host = urlparse(url).hostname or ""
         return "bedrock-runtime" in host and host.endswith(".amazonaws.com")
@@ -155,7 +155,7 @@ class BedrockExtractor:
 
 
 class CohereExtractor:
-    provider = Provider.UNKNOWN
+    provider = Provider.COHERE
     def match(self, url: str) -> bool:
         return (urlparse(url).hostname or "") == "api.cohere.com"
     def extract_usage(self, body: Any) -> NormalizedUsage | None:
@@ -180,14 +180,15 @@ _extractors: list[ProviderExtractor] = [
     DeepSeekExtractor(),
     BedrockExtractor(),
     CohereExtractor(),
-    _make_simple_extractor("openrouter.ai"),      # OpenRouter
-    _make_simple_extractor("api.x.ai"),            # xAI / Grok
-    _make_simple_extractor("api.groq.com"),        # Groq
-    _make_simple_extractor("api.mistral.ai"),       # Mistral
-    _make_simple_extractor("api.together.xyz"),     # Together AI
-    _make_simple_extractor("api.fireworks.ai"),     # Fireworks
-    _make_simple_extractor("api.perplexity.ai"),    # Perplexity
-    _make_simple_extractor("api.cerebras.ai"),      # Cerebras
+    _make_simple_extractor("openrouter.ai", Provider.OPENROUTER),
+    _make_simple_extractor("api.x.ai", Provider.XAI),
+    _make_simple_extractor("api.grok.xai.com", Provider.XAI),
+    _make_simple_extractor("api.groq.com", Provider.GROQ),
+    _make_simple_extractor("api.mistral.ai", Provider.MISTRAL),
+    _make_simple_extractor("api.together.xyz", Provider.TOGETHER),
+    _make_simple_extractor("api.fireworks.ai", Provider.FIREWORKS),
+    _make_simple_extractor("api.perplexity.ai", Provider.PERPLEXITY),
+    _make_simple_extractor("api.cerebras.ai", Provider.CEREBRAS)
 ]
 
 
