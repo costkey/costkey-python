@@ -18,15 +18,30 @@ _initialized = False
 
 
 def _parse_dsn(dsn: str) -> tuple[str, str, str]:
-    """Parse DSN → (endpoint, auth_key, project_id)."""
+    """Parse DSN → (endpoint, auth_key, project_id).
+
+    Expected format: https://<key>@app.costkey.dev/<project-id>
+    """
     from urllib.parse import urlparse
+
+    _DSN_HELP = 'Invalid DSN format. Expected: https://<key>@app.costkey.dev/<project-id>'
+
+    if not dsn or not isinstance(dsn, str):
+        raise ValueError(f"[costkey] {_DSN_HELP}")
+
     parsed = urlparse(dsn)
+
+    if not parsed.hostname:
+        raise ValueError(f"[costkey] {_DSN_HELP}")
+
     auth_key = parsed.username or ""
     if not auth_key:
-        raise ValueError(f"[costkey] DSN missing auth key: {dsn}")
+        raise ValueError(f"[costkey] DSN missing auth key. {_DSN_HELP}")
+
     project_id = parsed.path.lstrip("/")
     if not project_id:
-        raise ValueError(f"[costkey] DSN missing project ID: {dsn}")
+        raise ValueError(f"[costkey] DSN missing project ID. {_DSN_HELP}")
+
     endpoint = f"{parsed.scheme}://{parsed.hostname}"
     if parsed.port:
         endpoint += f":{parsed.port}"
@@ -37,7 +52,8 @@ def _parse_dsn(dsn: str) -> tuple[str, str, str]:
 def init(dsn: str, *, capture_body: bool = True,
          before_send: Callable[[CostKeyEvent], CostKeyEvent | None] | None = None,
          max_batch_size: int = 50, flush_interval: float = 5.0,
-         debug: bool = False, default_context: dict[str, Any] | None = None) -> None:
+         debug: bool = False, default_context: dict[str, Any] | None = None,
+         release: str | None = None) -> None:
     """
     Initialize CostKey. Call once at app startup.
 
@@ -57,7 +73,7 @@ def init(dsn: str, *, capture_body: bool = True,
     _transport = Transport(
         endpoint=endpoint, auth_key=auth_key,
         max_batch_size=max_batch_size, flush_interval=flush_interval,
-        debug=debug,
+        debug=debug, release=release,
     )
 
     patch(

@@ -353,7 +353,12 @@ def _wrap_streaming_response(
     def wrapped_read(*a: Any, **kw: Any) -> bytes:
         data = original_read(*a, **kw)
         _on_chunk(data)
-        _on_done()
+        # Only fire _on_done for successful responses (200-299).
+        # Error responses (4xx/5xx) use read() to get the error body,
+        # not as stream completion.
+        status = getattr(response, "status_code", 200)
+        if 200 <= status < 300:
+            _on_done()
         return data
 
     response.read = wrapped_read
@@ -394,7 +399,9 @@ def _wrap_streaming_response(
         async def wrapped_aread(*a: Any, **kw: Any) -> bytes:
             data = await original_aread(*a, **kw)
             _on_chunk(data)
-            _on_done()
+            status = getattr(response, "status_code", 200)
+            if 200 <= status < 300:
+                _on_done()
             return data
 
         response.aread = wrapped_aread

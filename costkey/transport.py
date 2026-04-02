@@ -12,12 +12,13 @@ logger = logging.getLogger("costkey")
 
 class Transport:
     def __init__(self, endpoint: str, auth_key: str, max_batch_size: int,
-                 flush_interval: float, debug: bool):
+                 flush_interval: float, debug: bool, release: str | None = None):
         self._endpoint = endpoint
         self._auth_key = auth_key
         self._max_batch_size = max_batch_size
         self._flush_interval = flush_interval
         self._debug = debug
+        self._release = release
         self._queue: list[dict[str, Any]] = []
         self._lock = threading.Lock()
         self._timer: threading.Timer | None = None
@@ -64,7 +65,9 @@ class Transport:
         batch = self._queue[:self._max_batch_size]
         self._queue = self._queue[self._max_batch_size:]
 
-        payload = {"sdkVersion": "python-0.2.1", "events": batch}
+        payload: dict[str, Any] = {"sdkVersion": "python-0.2.1", "events": batch}
+        if self._release:
+            payload["release"] = self._release
 
         try:
             resp = httpx.post(
