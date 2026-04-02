@@ -65,7 +65,7 @@ class Transport:
         batch = self._queue[:self._max_batch_size]
         self._queue = self._queue[self._max_batch_size:]
 
-        payload: dict[str, Any] = {"sdkVersion": "python-0.2.3", "events": batch}
+        payload: dict[str, Any] = {"sdkVersion": "python-0.3.0", "events": batch}
         if self._release:
             payload["release"] = self._release
 
