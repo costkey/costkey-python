@@ -64,7 +64,7 @@ class Transport:
         batch = self._queue[:self._max_batch_size]
         self._queue = self._queue[self._max_batch_size:]
 
-        payload = {"sdkVersion": "python-0.2.0", "events": batch}
+        payload = {"sdkVersion": "python-0.2.1", "events": batch}
 
         try:
             resp = httpx.post(

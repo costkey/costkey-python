@@ -39,8 +39,10 @@ def capture_call_site() -> CallSite | None:
     raw = traceback.format_stack()
     frames: list[StackFrame] = []
 
-    for line in reversed(raw):
-        line = line.strip()
+    for entry in reversed(raw):
+        # Each entry can be multi-line: 'File "...", line N, in func\n    code_line\n'
+        # Only parse the first line (the File line)
+        line = entry.strip().split("\n")[0].strip()
         if not line.startswith("File "):
             continue
         # Parse: File "path", line N, in func
