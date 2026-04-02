@@ -1,7 +1,9 @@
 """CostKey Python SDK — AI cost observability."""
 from __future__ import annotations
+import os
 import uuid
 import logging
+import threading
 from contextlib import contextmanager
 from contextvars import copy_context
 from typing import Any, Callable, Generator
@@ -53,7 +55,9 @@ def init(dsn: str, *, capture_body: bool = True,
          before_send: Callable[[CostKeyEvent], CostKeyEvent | None] | None = None,
          max_batch_size: int = 50, flush_interval: float = 5.0,
          debug: bool = False, default_context: dict[str, Any] | None = None,
-         release: str | None = None) -> None:
+         release: str | None = None,
+         project_root: str | None = None,
+         scan_callgraph: bool = True) -> None:
     """
     Initialize CostKey. Call once at app startup.
 
@@ -84,6 +88,22 @@ def init(dsn: str, *, capture_body: bool = True,
 
     _transport.start()
     _initialized = True
+
+    if scan_callgraph:
+        try:
+            from costkey.callgraph import scan_and_send
+            # Derive base URL by stripping /api/v1/events from the endpoint
+            base_url = endpoint.replace("/api/v1/events", "")
+            root = project_root or os.getcwd()
+            t = threading.Thread(
+                target=scan_and_send,
+                args=(base_url, auth_key, project_id, root, debug),
+                daemon=True,
+            )
+            t.start()
+        except Exception:
+            if debug:
+                logger.warning("[costkey] Failed to start call graph scan")
 
     if debug:
         logger.info(f"[costkey] Initialized for project {project_id}")
