@@ -99,9 +99,9 @@ class GoogleExtractor:
 
 # ── Additional providers (OpenAI-compatible) ──
 
-def _make_simple_extractor(hostname: str):
+def _make_simple_extractor(hostname: str, prov: Provider = Provider.UNKNOWN):
     class SimpleExtractor:
-        provider = Provider.UNKNOWN
+        provider = prov
         def match(self, url: str) -> bool:
             return (urlparse(url).hostname or "") == hostname
         def extract_usage(self, body: Any) -> NormalizedUsage | None:

@@ -64,7 +64,7 @@ class Transport:
         batch = self._queue[:self._max_batch_size]
         self._queue = self._queue[self._max_batch_size:]
 
-        payload = {"sdkVersion": "python-0.1.0", "events": batch}
+        payload = {"sdkVersion": "python-0.2.0", "events": batch}
 
         try:
             resp = httpx.post(
@@ -100,7 +100,12 @@ class Transport:
             "costUsd": event.cost_usd,
             "durationMs": event.duration_ms,
             "streaming": event.streaming,
-            "streamTiming": None,
+            "streamTiming": {
+                "ttft": event.stream_timing.ttft,
+                "tps": event.stream_timing.tps,
+                "streamDuration": event.stream_timing.stream_duration,
+                "chunkCount": event.stream_timing.chunk_count,
+            } if event.stream_timing else None,
             "callSite": None,
             "context": event.context,
             "requestBody": event.request_body,

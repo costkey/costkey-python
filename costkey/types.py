@@ -9,6 +9,17 @@ class Provider(str, Enum):
     ANTHROPIC = "anthropic"
     GOOGLE = "google"
     AZURE = "azure"
+    GROQ = "groq"
+    XAI = "xai"
+    MISTRAL = "mistral"
+    DEEPSEEK = "deepseek"
+    COHERE = "cohere"
+    TOGETHER = "together"
+    FIREWORKS = "fireworks"
+    PERPLEXITY = "perplexity"
+    CEREBRAS = "cerebras"
+    OPENROUTER = "openrouter"
+    BEDROCK = "bedrock"
     UNKNOWN = "unknown"
 
 

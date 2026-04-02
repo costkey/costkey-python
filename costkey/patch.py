@@ -7,10 +7,9 @@ import re
 import logging
 from contextvars import ContextVar
 from typing import Any, Callable
-from costkey.types import CostKeyEvent, NormalizedUsage, Provider
+from costkey.types import CostKeyEvent, NormalizedUsage, StreamTiming, Provider
 from costkey.providers import find_extractor
 from costkey.stack import capture_call_site
-from costkey.pricing import compute_cost
 from costkey.transport import Transport
 
 logger = logging.getLogger("costkey")
@@ -91,6 +90,51 @@ def unpatch() -> None:
     _state.patched = False
 
 
+def _is_streaming_request(request_body: Any) -> bool:
+    """Check if the request body has stream: true."""
+    if isinstance(request_body, dict):
+        return request_body.get("stream") is True
+    return False
+
+
+def _extract_sse_usage(text: str, extractor: Any) -> NormalizedUsage | None:
+    """Extract usage from accumulated SSE text — scan from the end for the final data chunk."""
+    lines = text.split("\n")
+    for i in range(len(lines) - 1, -1, -1):
+        line = lines[i]
+        if not line.startswith("data: "):
+            continue
+        data = line[6:].strip()
+        if data == "[DONE]":
+            continue
+        try:
+            parsed = json.loads(data)
+            usage = extractor.extract_usage(parsed)
+            if usage:
+                return usage
+        except Exception:
+            continue
+    return None
+
+
+def _extract_sse_model(text: str, request_body: Any, extractor: Any) -> str | None:
+    """Extract model name from SSE text."""
+    for line in text.split("\n"):
+        if not line.startswith("data: "):
+            continue
+        data = line[6:].strip()
+        if data == "[DONE]":
+            continue
+        try:
+            parsed = json.loads(data)
+            model = extractor.extract_model(request_body, parsed)
+            if model:
+                return model
+        except Exception:
+            continue
+    return None
+
+
 def _patch_httpx() -> None:
     try:
         import httpx
@@ -115,22 +159,38 @@ def _patch_httpx() -> None:
                 except Exception:
                     pass
 
+            is_streaming = _is_streaming_request(request_body)
+
+            # Force stream=True in kwargs so we can intercept the response stream
+            if is_streaming:
+                kwargs.setdefault("stream", True)
+
             response = _state._original_httpx_send(self, request, **kwargs)
-            duration_ms = (time.perf_counter() - start) * 1000
 
-            try:
-                response_body = response.json()
-            except Exception:
+            if is_streaming and hasattr(response, "stream"):
+                # Streaming response — wrap the stream to capture timing + usage
+                _handle_streaming_response(
+                    response, extractor, url, request.method,
+                    request_body, start, call_site, ctx,
+                )
+            else:
+                # Non-streaming — read response body
+                duration_ms = (time.perf_counter() - start) * 1000
                 response_body = None
+                try:
+                    response_body = response.json()
+                except Exception:
+                    pass
 
-            _process(extractor, url, request.method, response.status_code,
-                     request_body, response_body, duration_ms, call_site, ctx)
+                _process(extractor, url, request.method, response.status_code,
+                         request_body, response_body, duration_ms,
+                         False, None, call_site, ctx)
 
             return response
 
         httpx.Client.send = patched_send
 
-        # Also patch async client
+        # Async client
         _state._original_httpx_async_send = httpx.AsyncClient.send
 
         async def patched_async_send(self: Any, request: Any, **kwargs: Any) -> Any:
@@ -151,16 +211,29 @@ def _patch_httpx() -> None:
                 except Exception:
                     pass
 
+            is_streaming = _is_streaming_request(request_body)
+
+            if is_streaming:
+                kwargs.setdefault("stream", True)
+
             response = await _state._original_httpx_async_send(self, request, **kwargs)
-            duration_ms = (time.perf_counter() - start) * 1000
 
-            try:
-                response_body = response.json()
-            except Exception:
+            if is_streaming and hasattr(response, "stream"):
+                _handle_streaming_response(
+                    response, extractor, url, request.method,
+                    request_body, start, call_site, ctx,
+                )
+            else:
+                duration_ms = (time.perf_counter() - start) * 1000
                 response_body = None
+                try:
+                    response_body = response.json()
+                except Exception:
+                    pass
 
-            _process(extractor, url, request.method, response.status_code,
-                     request_body, response_body, duration_ms, call_site, ctx)
+                _process(extractor, url, request.method, response.status_code,
+                         request_body, response_body, duration_ms,
+                         False, None, call_site, ctx)
 
             return response
 
@@ -169,6 +242,113 @@ def _patch_httpx() -> None:
     except ImportError:
         if _state.debug:
             logger.debug("[costkey] httpx not installed, skipping patch")
+
+
+def _handle_streaming_response(
+    response: Any, extractor: Any, url: str, method: str,
+    request_body: Any, start: float,
+    call_site: Any, ctx: dict[str, Any],
+) -> None:
+    """Hook into httpx streaming response to capture TTFT, TPS, and usage."""
+    original_iter = response.stream.__class__.__iter__
+    original_aiter = getattr(response.stream.__class__, "__aiter__", None)
+
+    accumulated_text = ""
+    first_chunk_time: float | None = None
+    chunk_count = 0
+    event_sent = False
+
+    class StreamWrapper:
+        """Wraps the httpx stream to intercept chunks without buffering."""
+        def __init__(self, original_stream: Any) -> None:
+            self._stream = original_stream
+
+        def __iter__(self) -> Any:
+            nonlocal accumulated_text, first_chunk_time, chunk_count, event_sent
+            try:
+                for chunk in self._stream:
+                    chunk_count += 1
+                    if first_chunk_time is None:
+                        first_chunk_time = time.perf_counter()
+                    if isinstance(chunk, bytes):
+                        accumulated_text += chunk.decode("utf-8", errors="replace")
+                    else:
+                        accumulated_text += str(chunk)
+                    yield chunk
+            finally:
+                if not event_sent:
+                    event_sent = True
+                    _finalize_stream(
+                        extractor, url, method, response.status_code,
+                        request_body, accumulated_text,
+                        start, first_chunk_time, chunk_count,
+                        call_site, ctx,
+                    )
+
+        async def __aiter__(self) -> Any:
+            nonlocal accumulated_text, first_chunk_time, chunk_count, event_sent
+            try:
+                async for chunk in self._stream:
+                    chunk_count += 1
+                    if first_chunk_time is None:
+                        first_chunk_time = time.perf_counter()
+                    if isinstance(chunk, bytes):
+                        accumulated_text += chunk.decode("utf-8", errors="replace")
+                    else:
+                        accumulated_text += str(chunk)
+                    yield chunk
+            finally:
+                if not event_sent:
+                    event_sent = True
+                    _finalize_stream(
+                        extractor, url, method, response.status_code,
+                        request_body, accumulated_text,
+                        start, first_chunk_time, chunk_count,
+                        call_site, ctx,
+                    )
+
+        def close(self) -> None:
+            if hasattr(self._stream, "close"):
+                self._stream.close()
+
+        async def aclose(self) -> None:
+            if hasattr(self._stream, "aclose"):
+                await self._stream.aclose()
+
+    # Replace the stream object
+    response.stream = StreamWrapper(response.stream)
+
+
+def _finalize_stream(
+    extractor: Any, url: str, method: str, status_code: int | None,
+    request_body: Any, accumulated_text: str,
+    start: float, first_chunk_time: float | None, chunk_count: int,
+    call_site: Any, ctx: dict[str, Any],
+) -> None:
+    """Called when the stream ends — extract usage, compute timing, send event."""
+    end = time.perf_counter()
+    duration_ms = (end - start) * 1000
+
+    usage = _extract_sse_usage(accumulated_text, extractor)
+    model = _extract_sse_model(accumulated_text, request_body, extractor)
+
+    ttft = ((first_chunk_time - start) * 1000) if first_chunk_time else None
+    tps = None
+    if usage and usage.output_tokens and first_chunk_time:
+        stream_secs = end - first_chunk_time
+        if stream_secs > 0:
+            tps = usage.output_tokens / stream_secs
+
+    stream_timing = StreamTiming(
+        ttft=round(ttft, 2) if ttft else None,
+        tps=round(tps, 2) if tps else None,
+        stream_duration=round(duration_ms, 2),
+        chunk_count=chunk_count,
+    )
+
+    _process(extractor, url, method, status_code,
+             request_body, None, duration_ms,
+             True, stream_timing, call_site, ctx)
 
 
 def _unpatch_httpx() -> None:
@@ -215,7 +395,8 @@ def _patch_requests() -> None:
                 response_body = None
 
             _process(extractor, url, request.method, response.status_code,
-                     request_body, response_body, duration_ms, call_site, ctx)
+                     request_body, response_body, duration_ms,
+                     False, None, call_site, ctx)
 
             return response
 
@@ -237,11 +418,15 @@ def _unpatch_requests() -> None:
 
 def _process(extractor: Any, url: str, method: str, status_code: int | None,
              request_body: Any, response_body: Any,
-             duration_ms: float, call_site: Any, ctx: dict[str, Any]) -> None:
+             duration_ms: float, streaming: bool, stream_timing: StreamTiming | None,
+             call_site: Any, ctx: dict[str, Any]) -> None:
     try:
         usage = extractor.extract_usage(response_body) if response_body else None
         model = extractor.extract_model(request_body, response_body)
-        cost_usd = compute_cost(model, usage) if model and usage else None
+
+        # For streaming, usage comes from the stream finalizer, not response_body
+        if streaming and stream_timing and not usage:
+            usage = None  # Already handled in _finalize_stream
 
         event = CostKeyEvent(
             id=uuid.uuid4().hex,
@@ -253,9 +438,10 @@ def _process(extractor: Any, url: str, method: str, status_code: int | None,
             method=method,
             status_code=status_code,
             usage=usage,
-            cost_usd=cost_usd,
+            cost_usd=None,  # Server calculates cost
             duration_ms=round(duration_ms, 2),
-            streaming=False,
+            streaming=streaming,
+            stream_timing=stream_timing,
             call_site=call_site,
             context=ctx,
             request_body=_scrub(request_body) if _state.capture_body else None,
