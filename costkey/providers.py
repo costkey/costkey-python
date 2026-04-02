@@ -188,7 +188,12 @@ _extractors: list[ProviderExtractor] = [
     _make_simple_extractor("api.together.xyz", Provider.TOGETHER),
     _make_simple_extractor("api.fireworks.ai", Provider.FIREWORKS),
     _make_simple_extractor("api.perplexity.ai", Provider.PERPLEXITY),
-    _make_simple_extractor("api.cerebras.ai", Provider.CEREBRAS)
+    _make_simple_extractor("api.cerebras.ai", Provider.CEREBRAS),
+    # AI proxies/gateways
+    _make_simple_extractor("api.portkey.ai", Provider.OPENAI),
+    _make_simple_extractor("oai.helicone.ai", Provider.OPENAI),
+    _make_simple_extractor("anthropic.helicone.ai", Provider.ANTHROPIC),
+    _make_simple_extractor("gateway.helicone.ai", Provider.OPENAI),
 ]
 
 
