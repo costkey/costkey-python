@@ -1,6 +1,7 @@
-"""Batched async transport — ships events to costkey.dev. Never blocks. Never throws."""
+"""Batched async transport with retry + backoff. Never blocks. Never throws."""
 from __future__ import annotations
 import json
+import time
 import threading
 import logging
 from typing import Any
@@ -8,6 +9,11 @@ import httpx
 from costkey.types import CostKeyEvent
 
 logger = logging.getLogger("costkey")
+
+MAX_QUEUE_SIZE = 500
+MAX_RETRIES = 10
+BASE_BACKOFF_S = 2.0
+MAX_BACKOFF_S = 60.0
 
 
 class Transport:
@@ -22,7 +28,8 @@ class Transport:
         self._queue: list[dict[str, Any]] = []
         self._lock = threading.Lock()
         self._timer: threading.Timer | None = None
-        self._max_queue = 500
+        self._consecutive_failures = 0
+        self._backoff_until = 0.0
 
     def start(self) -> None:
         self._schedule_flush()
@@ -34,7 +41,7 @@ class Transport:
 
     def enqueue(self, event: CostKeyEvent) -> None:
         with self._lock:
-            if len(self._queue) >= self._max_queue:
+            if len(self._queue) >= MAX_QUEUE_SIZE:
                 self._queue.pop(0)
                 if self._debug:
                     logger.warning("[costkey] Queue full, dropping oldest event")
@@ -62,6 +69,14 @@ class Transport:
         if not self._queue:
             return
 
+        # Respect backoff
+        now = time.monotonic()
+        if now < self._backoff_until:
+            if self._debug:
+                wait = round(self._backoff_until - now)
+                logger.warning(f"[costkey] Backing off, retry in {wait}s")
+            return
+
         batch = self._queue[:self._max_batch_size]
         self._queue = self._queue[self._max_batch_size:]
 
@@ -75,19 +90,52 @@ class Transport:
                 json=payload,
                 headers={
                     "Authorization": f"Bearer {self._auth_key}",
-                    "User-Agent": "costkey-python/0.1.0",
+                    "User-Agent": "costkey-python/0.3.0",
                 },
                 timeout=10,
             )
             if resp.status_code == 429:
+                # Rate limited — put events back
                 self._queue = batch + self._queue
+                self._apply_backoff()
                 if self._debug:
                     logger.warning("[costkey] Rate limited, will retry")
-            elif not resp.is_success and self._debug:
-                logger.warning(f"[costkey] Ingest returned {resp.status_code}")
+            elif resp.status_code >= 500:
+                # Server error — put events back and retry
+                self._queue = batch + self._queue
+                self._apply_backoff()
+                if self._debug:
+                    logger.warning(f"[costkey] Server error {resp.status_code}, will retry ({self._consecutive_failures} failures)")
+            elif not resp.is_success:
+                # Client error — drop, won't succeed on retry
+                if self._debug:
+                    logger.warning(f"[costkey] Ingest returned {resp.status_code}")
+            else:
+                # Success — reset backoff
+                self._consecutive_failures = 0
+                self._backoff_until = 0.0
         except Exception as e:
+            # Network error — put events back and retry
+            self._queue = batch + self._queue
+            self._apply_backoff()
             if self._debug:
-                logger.warning(f"[costkey] Failed to send events: {e}")
+                logger.warning(f"[costkey] Network error, {len(self._queue)} events queued, retry in {self._get_backoff_s():.0f}s: {e}")
+
+    def _apply_backoff(self) -> None:
+        self._consecutive_failures += 1
+        backoff = self._get_backoff_s()
+        self._backoff_until = time.monotonic() + backoff
+
+        # After too many failures, drop old events to prevent unbounded growth
+        if self._consecutive_failures > MAX_RETRIES and len(self._queue) > MAX_QUEUE_SIZE // 2:
+            drop_count = len(self._queue) // 4
+            self._queue = self._queue[drop_count:]
+            if self._debug:
+                logger.warning(f"[costkey] Too many failures, dropped {drop_count} oldest events")
+
+    def _get_backoff_s(self) -> float:
+        # Exponential backoff: 2s, 4s, 8s, 16s, 32s, 60s, 60s...
+        return min(BASE_BACKOFF_S * (2 ** (self._consecutive_failures - 1)), MAX_BACKOFF_S)
 
     def _serialize(self, event: CostKeyEvent) -> dict[str, Any]:
         d: dict[str, Any] = {
