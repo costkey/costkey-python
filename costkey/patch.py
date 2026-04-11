@@ -1,6 +1,7 @@
 """Monkey-patch HTTP clients to intercept AI provider calls."""
 from __future__ import annotations
 import json
+import datetime
 import time
 import uuid
 import re
@@ -486,7 +487,7 @@ def _process(extractor: Any, url: str, method: str, status_code: int | None,
 
         event = CostKeyEvent(
             id=uuid.uuid4().hex,
-            timestamp=time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime()),
+            timestamp=datetime.datetime.now(datetime.timezone.utc).isoformat(timespec='milliseconds').replace('+00:00', 'Z'),
             project_id=_state.project_id,
             provider=extractor.provider,
             model=model,

@@ -157,7 +157,14 @@ class Transport:
                 "streamDuration": event.stream_timing.stream_duration,
                 "chunkCount": event.stream_timing.chunk_count,
             } if event.stream_timing else None,
-            "callSite": None,
+            "callSite": {
+                "raw": event.call_site.raw,
+                "frames": [
+                    {"functionName": f.function_name, "fileName": f.file_name,
+                     "lineNumber": f.line_number, "columnNumber": None}
+                    for f in event.call_site.frames
+                ],
+            } if event.call_site else None,
             "context": event.context,
             "requestBody": event.request_body,
             "responseBody": event.response_body,
@@ -170,14 +177,5 @@ class Transport:
                 "reasoningTokens": event.usage.reasoning_tokens,
                 "cacheReadTokens": event.usage.cache_read_tokens,
                 "cacheCreationTokens": event.usage.cache_creation_tokens,
-            }
-        if event.call_site:
-            d["callSite"] = {
-                "raw": event.call_site.raw,
-                "frames": [
-                    {"functionName": f.function_name, "fileName": f.file_name,
-                     "lineNumber": f.line_number, "columnNumber": None}
-                    for f in event.call_site.frames
-                ],
             }
         return d
