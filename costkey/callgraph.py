@@ -142,6 +142,8 @@ def _extract_attr_chain(node: ast.expr) -> list[str]:
 def build_call_graph(files: list[str], project_root: str) -> dict[str, dict[str, Any]]:
     """Parse files and build a call graph keyed by 'relative/path.py:function_name'."""
     graph: dict[str, dict[str, Any]] = {}
+    # Global map: function_name -> list of full keys (for cross-file resolution)
+    global_fn_map: dict[str, list[str]] = {}
 
     for filepath in files:
         try:
@@ -159,26 +161,46 @@ def build_call_graph(files: list[str], project_root: str) -> dict[str, dict[str,
         visitor.visit(tree)
 
         rel = os.path.relpath(filepath, project_root)
-        # Normalize to forward slashes
         rel = rel.replace(os.sep, "/")
 
-        # Collect all function names in this file for intra-file resolution
         all_names = set(visitor.functions.keys())
 
         for func_name, info in visitor.functions.items():
             key = f"{rel}:{func_name}"
-            # Resolve call_names to callees within the same file
+            # Resolve intra-file callees
             callees: list[str] = []
+            unresolved: list[str] = []
             for cname in info["call_names"]:
-                # Match plain name or ClassName.method
                 if cname in all_names and cname != func_name:
                     callees.append(cname)
+                elif cname != func_name:
+                    unresolved.append(cname)
 
             graph[key] = {
                 "calls_ai": info["calls_ai"],
                 "callees": callees,
                 "lineno": info["lineno"],
+                "_unresolved": unresolved,
             }
+
+            # Register in global map for cross-file resolution
+            short_name = func_name.split(".")[-1]  # Handle ClassName.method
+            global_fn_map.setdefault(func_name, []).append(key)
+            if short_name != func_name:
+                global_fn_map.setdefault(short_name, []).append(key)
+
+    # Second pass: resolve cross-file calls
+    for key, info in graph.items():
+        file_prefix = key.rsplit(":", 1)[0]
+        for cname in info.get("_unresolved", []):
+            candidates = global_fn_map.get(cname, [])
+            for candidate in candidates:
+                # Don't link to self or same-file (already resolved)
+                if candidate != key and not candidate.startswith(file_prefix + ":"):
+                    info["callees"].append(candidate.rsplit(":", 1)[1])
+                    break
+        # Clean up temp field
+        info.pop("_unresolved", None)
 
     return graph
 
@@ -190,14 +212,25 @@ def compute_scores(graph: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]
     for key in graph:
         fan_in[key] = 0
 
-    # Build a mapping from short function names to full keys for callee resolution
-    # Within the same file prefix
+    # Build a mapping from function names to full keys for callee resolution
+    fn_to_keys: dict[str, list[str]] = {}
+    for key in graph:
+        fn = key.rsplit(":", 1)[1]
+        fn_to_keys.setdefault(fn, []).append(key)
+
     for key, info in graph.items():
         file_prefix = key.rsplit(":", 1)[0]
         for callee_name in info["callees"]:
+            # Try same-file first
             callee_key = f"{file_prefix}:{callee_name}"
             if callee_key in fan_in:
                 fan_in[callee_key] += 1
+            else:
+                # Try cross-file
+                for candidate in fn_to_keys.get(callee_name, []):
+                    if candidate in fan_in:
+                        fan_in[candidate] += 1
+                        break
 
     # BFS to compute ai_distance for each function
     # ai_distance = 0 means it directly calls AI
@@ -208,11 +241,18 @@ def compute_scores(graph: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]
     adjacency: dict[str, list[str]] = {}
     for key, info in graph.items():
         file_prefix = key.rsplit(":", 1)[0]
-        adj = []
+        adj: list[str] = []
         for callee_name in info["callees"]:
+            # Try same-file first
             callee_key = f"{file_prefix}:{callee_name}"
             if callee_key in graph:
                 adj.append(callee_key)
+            else:
+                # Try cross-file
+                for candidate in fn_to_keys.get(callee_name, []):
+                    if candidate in graph:
+                        adj.append(candidate)
+                        break
         adjacency[key] = adj
 
     # Seed: functions that directly call AI
