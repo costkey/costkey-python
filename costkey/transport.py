@@ -80,7 +80,7 @@ class Transport:
         batch = self._queue[:self._max_batch_size]
         self._queue = self._queue[self._max_batch_size:]
 
-        payload: dict[str, Any] = {"sdkVersion": "python-0.3.0", "events": batch}
+        payload: dict[str, Any] = {"sdkVersion": "python-0.4.0", "events": batch}
         if self._release:
             payload["release"] = self._release
 
@@ -90,7 +90,7 @@ class Transport:
                 json=payload,
                 headers={
                     "Authorization": f"Bearer {self._auth_key}",
-                    "User-Agent": "costkey-python/0.3.0",
+                    "User-Agent": "costkey-python/0.4.0",
                 },
                 timeout=10,
             )

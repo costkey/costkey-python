@@ -352,7 +352,7 @@ def scan_and_send(
             }
 
         payload: dict[str, Any] = {
-            "sdkVersion": "python-0.2.3",
+            "sdkVersion": "python-0.4.0",
             "functions": functions,
         }
 
@@ -380,7 +380,7 @@ def scan_and_send(
             json=payload,
             headers={
                 "Authorization": f"Bearer {auth_key}",
-                "User-Agent": "costkey-python/0.2.3",
+                "User-Agent": "costkey-python/0.4.0",
             },
             timeout=10,
         )
