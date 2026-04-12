@@ -30,6 +30,7 @@ class Transport:
         self._timer: threading.Timer | None = None
         self._consecutive_failures = 0
         self._backoff_until = 0.0
+        self._connected = False
 
     def start(self) -> None:
         self._schedule_flush()
@@ -94,7 +95,10 @@ class Transport:
                 },
                 timeout=10,
             )
-            if resp.status_code == 429:
+            if resp.status_code in (401, 403):
+                # Auth failure — always log (not just debug)
+                logger.warning(f"[costkey] Authentication failed ({resp.status_code}). Check your DSN at https://app.costkey.dev/settings")
+            elif resp.status_code == 429:
                 # Rate limited — put events back
                 self._queue = batch + self._queue
                 self._apply_backoff()
@@ -114,6 +118,9 @@ class Transport:
                 # Success — reset backoff
                 self._consecutive_failures = 0
                 self._backoff_until = 0.0
+                if not self._connected:
+                    self._connected = True
+                    print("[costkey] Connected. Tracking AI calls.")
         except Exception as e:
             # Network error — put events back and retry
             self._queue = batch + self._queue

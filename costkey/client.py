@@ -26,7 +26,7 @@ def _parse_dsn(dsn: str) -> tuple[str, str, str]:
     """
     from urllib.parse import urlparse
 
-    _DSN_HELP = 'Invalid DSN format. Expected: https://<key>@app.costkey.dev/<project-id>'
+    _DSN_HELP = 'Invalid DSN format. Expected: https://<key>@app.costkey.dev/<project-id>  Get your DSN at https://app.costkey.dev'
 
     if not dsn or not isinstance(dsn, str):
         raise ValueError(f"[costkey] {_DSN_HELP}")
@@ -51,7 +51,7 @@ def _parse_dsn(dsn: str) -> tuple[str, str, str]:
     return endpoint, auth_key, project_id
 
 
-def init(dsn: str, *, capture_body: bool = True,
+def init(dsn: str | None = None, *, capture_body: bool = True,
          before_send: Callable[[CostKeyEvent], CostKeyEvent | None] | None = None,
          max_batch_size: int = 50, flush_interval: float = 5.0,
          debug: bool = False, default_context: dict[str, Any] | None = None,
@@ -64,6 +64,9 @@ def init(dsn: str, *, capture_body: bool = True,
     >>> import costkey
     >>> costkey.init(dsn="https://ck_abc123@app.costkey.dev/my-project")
     >>> # That's it. Every AI call is now tracked.
+
+    If no DSN is provided, falls back to COSTKEY_DSN env var.
+    If neither exists, silently no-ops (test mode).
     """
     global _transport, _initialized
 
@@ -72,7 +75,14 @@ def init(dsn: str, *, capture_body: bool = True,
             logger.warning("[costkey] Already initialized, skipping")
         return
 
-    endpoint, auth_key, project_id = _parse_dsn(dsn)
+    # DSN resolution: param → env var → test mode (no-op)
+    resolved_dsn = dsn or os.environ.get("COSTKEY_DSN")
+    if not resolved_dsn:
+        if debug:
+            logger.info("[costkey] No DSN provided, running in test mode (no events will be sent)")
+        return
+
+    endpoint, auth_key, project_id = _parse_dsn(resolved_dsn)
 
     _transport = Transport(
         endpoint=endpoint, auth_key=auth_key,
