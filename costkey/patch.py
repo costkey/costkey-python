@@ -50,6 +50,181 @@ def _scrub(obj: Any) -> Any:
     return obj
 
 
+def _text_from_content(content: Any) -> str | None:
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return None
+    parts: list[str] = []
+    for part in content:
+        if isinstance(part, str):
+            parts.append(part)
+        elif isinstance(part, dict) and isinstance(part.get("text"), str):
+            parts.append(part["text"])
+    return "\n".join(parts) if parts else None
+
+
+def _extract_system_prompt(body: Any) -> str | None:
+    if not isinstance(body, dict):
+        return None
+
+    direct = _text_from_content(
+        body.get("system") or body.get("system_prompt") or body.get("systemPrompt")
+    )
+    if direct:
+        return direct
+
+    system_instruction = body.get("system_instruction") or body.get("systemInstruction")
+    if isinstance(system_instruction, dict):
+        from_parts = _text_from_content(system_instruction.get("parts"))
+        if from_parts:
+            return from_parts
+
+    messages = body.get("messages")
+    if isinstance(messages, list):
+        prompts = []
+        for message in messages:
+            if not isinstance(message, dict):
+                continue
+            if message.get("role") not in ("system", "developer"):
+                continue
+            content = _text_from_content(message.get("content"))
+            if content:
+                prompts.append(content)
+        if prompts:
+            return "\n\n".join(prompts)
+
+    return None
+
+
+def _collect_tool_results(messages: Any) -> list[Any]:
+    if not isinstance(messages, list):
+        return []
+    results: list[Any] = []
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        if message.get("role") in ("tool", "function"):
+            results.append(message)
+        content = message.get("content")
+        if isinstance(content, list):
+            results.extend(
+                block for block in content
+                if isinstance(block, dict) and block.get("type") == "tool_result"
+            )
+    return results
+
+
+def _collect_response_items(response_body: Any) -> tuple[list[Any], list[Any], list[Any]]:
+    tool_calls: list[Any] = []
+    web_searches: list[Any] = []
+    citations: list[Any] = []
+    if not isinstance(response_body, dict):
+        return tool_calls, web_searches, citations
+
+    choices = response_body.get("choices")
+    if isinstance(choices, list):
+        for choice in choices:
+            if not isinstance(choice, dict) or not isinstance(choice.get("message"), dict):
+                continue
+            message = choice["message"]
+            if isinstance(message.get("tool_calls"), list):
+                tool_calls.extend(message["tool_calls"])
+            if message.get("function_call"):
+                tool_calls.append(message["function_call"])
+            if isinstance(message.get("annotations"), list):
+                citations.extend(message["annotations"])
+
+    output = response_body.get("output")
+    if isinstance(output, list):
+        for item in output:
+            if not isinstance(item, dict):
+                continue
+            item_type = str(item.get("type", ""))
+            if "function_call" in item_type or "tool_call" in item_type:
+                tool_calls.append(item)
+            if "web_search" in item_type:
+                web_searches.append(item)
+            if isinstance(item.get("content"), list):
+                for content in item["content"]:
+                    if isinstance(content, dict) and isinstance(content.get("annotations"), list):
+                        citations.extend(content["annotations"])
+
+    content = response_body.get("content")
+    if isinstance(content, list):
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") == "tool_use":
+                tool_calls.append(block)
+            if isinstance(block.get("citations"), list):
+                citations.extend(block["citations"])
+
+    function_calls = response_body.get("functionCalls") or response_body.get("function_calls")
+    if isinstance(function_calls, list):
+        tool_calls.extend(function_calls)
+
+    candidates = response_body.get("candidates")
+    if isinstance(candidates, list):
+        for candidate in candidates:
+            if not isinstance(candidate, dict):
+                continue
+            grounding = candidate.get("groundingMetadata") or candidate.get("grounding_metadata")
+            if grounding:
+                web_searches.append(grounding)
+
+    usage = response_body.get("usage")
+    if isinstance(usage, dict) and usage.get("server_tool_use"):
+        web_searches.append({"usage": usage["server_tool_use"]})
+
+    return tool_calls, web_searches, citations
+
+
+def _extract_metadata(request_body: Any, response_body: Any) -> dict[str, Any] | None:
+    if not isinstance(request_body, dict) and not isinstance(response_body, dict):
+        return None
+    req = request_body if isinstance(request_body, dict) else {}
+    metadata: dict[str, Any] = {}
+
+    messages = req.get("messages")
+    if isinstance(messages, list):
+        metadata["prompts"] = [
+            {
+                "role": str(message.get("role", "unknown")) if isinstance(message, dict) else "unknown",
+                "content": message.get("content") if isinstance(message, dict) else message,
+            }
+            for message in messages
+        ]
+    elif isinstance(req.get("contents"), list):
+        metadata["prompts"] = [
+            {
+                "role": str(content.get("role", "user")) if isinstance(content, dict) else "user",
+                "content": content,
+            }
+            for content in req["contents"]
+        ]
+    elif "input" in req:
+        metadata["prompts"] = [{"role": "input", "content": req["input"]}]
+
+    if isinstance(req.get("tools"), list) and req["tools"]:
+        metadata["toolDefinitions"] = req["tools"]
+    if "tool_choice" in req or "toolChoice" in req:
+        metadata["toolChoice"] = req.get("tool_choice", req.get("toolChoice"))
+
+    tool_calls, web_searches, citations = _collect_response_items(response_body)
+    tool_results = _collect_tool_results(messages)
+    if tool_calls:
+        metadata["toolCalls"] = tool_calls
+    if tool_results:
+        metadata["toolResults"] = tool_results
+    if web_searches:
+        metadata["webSearches"] = web_searches
+    if citations:
+        metadata["citations"] = citations
+
+    return metadata or None
+
+
 class _PatchState:
     def __init__(self) -> None:
         self.transport: Transport | None = None
@@ -501,6 +676,8 @@ def _process(extractor: Any, url: str, method: str, status_code: int | None,
             stream_timing=stream_timing,
             call_site=call_site,
             context=ctx,
+            metadata=_scrub(_extract_metadata(request_body, response_body)),
+            system_prompt=_scrub(_extract_system_prompt(request_body)),
             request_body=_scrub(request_body) if _state.capture_body else None,
             response_body=_scrub(response_body) if _state.capture_body else None,
         )

@@ -4,8 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "costkey"
-version = "0.5.0"
-description = "AI cost observability. Track every LLM call's cost, tokens, and latency with one line of code."
+version = "0.5.1"
+description = "AI cost observability. Track every LLM call's cost, tokens, latency, prompts, and tool metadata with one CLI command."
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.9"
@@ -21,6 +21,9 @@ classifiers = [
 dependencies = [
     "httpx>=0.24.0",
 ]
+
+[project.scripts]
+costkey = "costkey.cli:main"
 
 [project.urls]
 Homepage = "https://costkey.dev"

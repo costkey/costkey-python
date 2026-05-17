@@ -71,6 +71,8 @@ class CostKeyEvent:
     stream_timing: StreamTiming | None = None
     call_site: CallSite | None = None
     context: dict[str, Any] = field(default_factory=dict)
+    metadata: dict[str, Any] | None = None
+    system_prompt: str | None = None
     request_body: Any = None
     response_body: Any = None
 

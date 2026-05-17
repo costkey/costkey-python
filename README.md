@@ -1,11 +1,19 @@
 # costkey
 
-> AI cost observability. Track every LLM call's cost, tokens, and latency with one line of code.
+> AI cost observability. Track every LLM call's cost, tokens, latency, prompts, and tool metadata with one CLI command.
 
-## Install
+## Setup
 
 ```bash
-pip install costkey
+pipx run costkey setup
+```
+
+The setup command authenticates in your browser, creates a project, writes `COSTKEY_DSN` to `.env`, detects FastAPI, Django, Flask, and plain Python apps, and writes `.costkey/setup.md`.
+
+For no-code Python bootstrapping:
+
+```bash
+PYTHONPATH="$PWD/.costkey:$PYTHONPATH" uvicorn app:app
 ```
 
 ## Quick Start
@@ -28,6 +36,7 @@ costkey.init(dsn="https://ck_your_key@app.costkey.dev/your-project")
 - **Request tracing** — group AI calls per request with `start_trace()`
 - **Feature detection** — call chains analyzed to detect logical "features" in your code
 - **Body capture** — input prompts + output completions captured and scrubbed
+- **Prompt + tool metadata** — system prompts, messages, tool calls, and provider metadata on each trace
 - **Credential scrubbing** — API keys, JWTs, and secrets auto-redacted
 
 ## How It Works

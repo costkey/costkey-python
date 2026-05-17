@@ -173,6 +173,8 @@ class Transport:
                 ],
             } if event.call_site else None,
             "context": event.context,
+            "metadata": event.metadata,
+            "systemPrompt": event.system_prompt,
             "requestBody": event.request_body,
             "responseBody": event.response_body,
         }
