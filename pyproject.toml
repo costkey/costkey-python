@@ -10,13 +10,18 @@ readme = "README.md"
 license = "MIT"
 requires-python = ">=3.9"
 authors = [{ name = "CostKey", email = "hello@costkey.dev" }]
-keywords = ["ai", "llm", "cost", "tracking", "observability", "openai", "anthropic", "gemini"]
+keywords = ["ai", "llm", "cost", "tracking", "observability", "openai", "anthropic", "gemini", "agents", "prompts"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
     "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
     "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: System :: Monitoring",
 ]
 dependencies = [
     "httpx>=0.24.0",
@@ -29,6 +34,8 @@ costkey = "costkey.cli:main"
 Homepage = "https://costkey.dev"
 Repository = "https://github.com/costkey/costkey-python"
 Documentation = "https://github.com/costkey/costkey-python"
+Issues = "https://github.com/costkey/costkey-python/issues"
+Changelog = "https://github.com/costkey/costkey-python/releases"
 
 [tool.hatch.build.targets.wheel]
 packages = ["costkey"]
