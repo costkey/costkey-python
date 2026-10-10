@@ -271,7 +271,17 @@ costkey.init(
 
 ## Providers
 
-Built-in detection covers OpenAI, Anthropic, Google Gemini, Google Vertex AI, Azure OpenAI, Groq, xAI, Mistral, DeepSeek, Cohere, Together, Fireworks, Perplexity, Cerebras, OpenRouter, AWS Bedrock, ElevenLabs, Rumik, Exa, Firecrawl, and TypeSafe.
+Built-in detection covers:
+
+- **Model APIs:** OpenAI (including audio), Azure OpenAI, Anthropic, Google Gemini, Google Vertex AI (Gemini and partner models such as Claude, Llama and Mistral), AWS Bedrock, xAI, Mistral, DeepSeek, Cohere, AI21, Upstage, Sarvam, and TypeSafe.
+- **OpenAI-compatible hosts:** Groq, Together, Fireworks, Perplexity, Cerebras, OpenRouter, DeepInfra, NVIDIA NIM, SambaNova, Novita, Hyperbolic, Nebius, Alibaba Cloud Model Studio (DashScope), Moonshot (Kimi), Z.ai (GLM), MiniMax, Hugging Face Inference Providers, Baseten, Lambda, Featherless, Friendli, Cloudflare Workers AI, Vercel AI Gateway, and a local Ollama server (port 11434). Gateways such as Portkey and Helicone are detected too.
+- **Speech:** ElevenLabs, Deepgram, AssemblyAI, Cartesia, Rumik, Sarvam, MiniMax and OpenAI speech/transcription.
+- **Embeddings, rerank and search:** Voyage AI, Jina AI, Cohere, Exa, Tavily and Firecrawl.
+
+Each call is reported with a provider id and model; CostKey prices it on the
+server from token usage and `usage.nativeUnits`. Text-to-speech is counted
+from the request text (or the provider's character header), never from the
+audio, and audio responses are not buffered.
 
 Calls that are not billed per token report provider-native units in
 `usage.nativeUnits`, and provider-reported amounts in `usage.costUsd`:
@@ -284,9 +294,22 @@ Calls that are not billed per token report provider-native units in
 | Rumik | `characters` |
 | Exa | `searchQueries` and `searchResults` (search, find-similar), `pages` (contents), `costUsd` from `costDollars.total` |
 | Firecrawl | `credits` (reported `creditsUsed`; scrape and map default to 1), `searchQueries`/`searchResults` for search |
+| OpenAI / Azure `audio/speech` | `characters` of the request `input` |
+| OpenAI / Azure `audio/transcriptions`, `audio/translations` | `audioSeconds` (duration usage or verbose_json `duration`), or tokens for token-billed models |
+| Deepgram | `audioSeconds` for `/v1/listen` (model from the `model` query, default `nova-3`), `characters` for `/v1/speak` |
+| AssemblyAI | `audioSeconds` on the `GET /v2/transcript/{id}` that reports `completed` |
+| Cartesia | `characters` of the request `transcript` |
+| MiniMax T2A (`/v1/t2a_v2`) | `characters` of the request `text` |
+| Sarvam | `characters` for text-to-speech (default `bulbul:v2`), `audioSeconds` for speech-to-text when reported (default `saarika:v2.5`) |
+| Cohere rerank | `searchQueries` from `billed_units.search_units` |
+| Tavily | `searchQueries` for search (model `search` or `search-advanced`), `credits` when the request sets `include_usage` |
 
 Firecrawl job status polls (`/v2/crawl/{id}` and similar) are recorded without
 credits, since each poll repeats the job's running total.
+
+Voyage and Jina embeddings and rerank report their `usage.total_tokens` as
+input tokens. Native Ollama calls (`/api/chat`, `/api/generate`) report
+`prompt_eval_count`/`eval_count` as input/output tokens, streamed or not.
 
 Add your own provider or internal gateway:
 

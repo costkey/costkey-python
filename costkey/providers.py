@@ -4,7 +4,7 @@ import dataclasses
 import logging
 import math
 import re
-from urllib.parse import urlparse, unquote
+from urllib.parse import parse_qs, urlparse, unquote
 from typing import Any, Protocol
 from costkey.types import Provider, NormalizedUsage
 
@@ -20,6 +20,10 @@ class ProviderExtractor(Protocol):
     # (per-character TTS, per-query search) also define
     #   extract_call_usage(url, request_body, response_body, headers)
     #   extract_call_model(url, request_body, response_body)
+    # An extractor that sets ``call_usage_takes_method = True`` also receives
+    # ``method=`` in extract_call_usage (usage that only a GET reports).
+    # Optional: ``audio_response(url) -> bool`` marks endpoints whose response
+    # is audio (raw, base64 or hex) so it is never buffered or parsed.
 
 
 def _as_int(val: Any) -> int | None:
@@ -108,7 +112,8 @@ def merge_usage(current: NormalizedUsage | None, nxt: NormalizedUsage) -> Normal
 
 
 def call_usage(extractor: Any, url: str, request_body: Any, response_body: Any,
-               headers: Any = None, status_code: int | None = None) -> NormalizedUsage | None:
+               headers: Any = None, status_code: int | None = None,
+               method: str | None = None) -> NormalizedUsage | None:
     """Usage for one call, from the response or, where the provider bills on
     the request (characters, queries), from the URL, request and headers."""
     try:
@@ -118,11 +123,22 @@ def call_usage(extractor: Any, url: str, request_body: Any, response_body: Any,
             # a failed call.
             if status_code is not None and status_code >= 400:
                 return None
+            if getattr(extractor, "call_usage_takes_method", False) is True:
+                return hook(url, request_body, response_body, headers, method=method)
             return hook(url, request_body, response_body, headers)
         return extractor.extract_usage(response_body) if response_body else None
     except Exception:
         logger.debug("[costkey] usage extraction failed", exc_info=True)
         return None
+
+
+def is_audio_response(extractor: Any, url: str) -> bool:
+    """Whether this endpoint answers with audio that must not be read."""
+    try:
+        hook = getattr(extractor, "audio_response", None)
+        return bool(callable(hook) and hook(url))
+    except Exception:
+        return False
 
 
 def call_model(extractor: Any, url: str, request_body: Any, response_body: Any) -> str | None:
@@ -227,6 +243,28 @@ def _extract_model(request_body: Any, response_body: Any) -> str | None:
     return None
 
 
+def _openai_response_usage(body: Any) -> NormalizedUsage | None:
+    """The OpenAI extractor's usage logic, shared by every OpenAI-compatible
+    host: chat/completions, completions, embeddings, responses and audio."""
+    usage_body = body.get("usage") if isinstance(body, dict) else None
+    if isinstance(usage_body, dict) and usage_body.get("type") == "duration":
+        # Whisper-style transcription bills the audio's length.
+        seconds = _as_number(usage_body.get("seconds"))
+        return NormalizedUsage(native_units={"audioSeconds": seconds}) if seconds is not None and seconds >= 0 else None
+    usage = _extract_openai_usage(body)
+    if usage and isinstance(usage_body, dict):
+        details = usage_body.get("completion_tokens_details") or usage_body.get("output_tokens_details") or {}
+        if isinstance(details, dict):
+            detail_reasoning = _as_int(details.get("reasoning_tokens"))
+            if detail_reasoning is not None:
+                usage.reasoning_tokens = detail_reasoning
+    return usage
+
+
+_OPENAI_SPEECH_PATH = re.compile(r"/audio/speech/?$")
+_OPENAI_TRANSCRIBE_PATH = re.compile(r"/audio/(?:transcriptions|translations)/?$")
+
+
 class OpenAIExtractor:
     provider = Provider.OPENAI
     def match(self, url: str) -> bool:
@@ -238,17 +276,39 @@ class OpenAIExtractor:
             or host.endswith(".cognitiveservices.azure.com")
         )
     def extract_usage(self, body: Any) -> NormalizedUsage | None:
-        usage = _extract_openai_usage(body)
-        if usage and isinstance(body, dict):
-            u = body.get("usage", {})
-            details = u.get("completion_tokens_details") or u.get("output_tokens_details") or {}
-            if isinstance(details, dict):
-                detail_reasoning = _as_int(details.get("reasoning_tokens"))
-                if detail_reasoning is not None:
-                    usage.reasoning_tokens = detail_reasoning
-        return usage
+        return _openai_response_usage(body)
     def extract_model(self, req: Any, resp: Any) -> str | None:
         return _extract_model(req, resp)
+    def audio_response(self, url: str) -> bool:
+        return bool(_OPENAI_SPEECH_PATH.search(urlparse(url).path or ""))
+    def extract_call_usage(self, url: str, req: Any, resp: Any, headers: Any) -> NormalizedUsage | None:
+        path = urlparse(url).path or ""
+        if _OPENAI_SPEECH_PATH.search(path):
+            characters = _request_text_length(req, "input")
+            return NormalizedUsage(native_units={"characters": characters}) if characters is not None else None
+        usage = self.extract_usage(resp) if resp else None
+        if usage is None and _OPENAI_TRANSCRIBE_PATH.search(path):
+            # verbose_json transcriptions report the audio's duration.
+            seconds = _duration_field(resp)
+            if seconds is not None:
+                usage = NormalizedUsage(native_units={"audioSeconds": seconds})
+        return usage
+
+
+def _anthropic_usage(body: Any) -> NormalizedUsage | None:
+    if not isinstance(body, dict): return None
+    usage = body.get("usage")
+    if not isinstance(usage, dict): return None
+    input_t = _as_int(usage.get("input_tokens"))
+    output_t = _as_int(usage.get("output_tokens"))
+    total_t = (input_t or 0) + (output_t or 0) if input_t is not None or output_t is not None else None
+    return NormalizedUsage(input_tokens=input_t, output_tokens=output_t, total_tokens=total_t,
+        cache_read_tokens=_as_int(usage.get("cache_read_input_tokens")),
+        cache_creation_tokens=_as_int(usage.get("cache_creation_input_tokens")),
+        native_units=_native_units(usage, exclude={
+            "input_tokens", "output_tokens", "cache_read_input_tokens",
+            "cache_creation_input_tokens",
+        }))
 
 
 class AnthropicExtractor:
@@ -256,21 +316,23 @@ class AnthropicExtractor:
     def match(self, url: str) -> bool:
         return (urlparse(url).hostname or "") == "api.anthropic.com"
     def extract_usage(self, body: Any) -> NormalizedUsage | None:
-        if not isinstance(body, dict): return None
-        usage = body.get("usage")
-        if not isinstance(usage, dict): return None
-        input_t = _as_int(usage.get("input_tokens"))
-        output_t = _as_int(usage.get("output_tokens"))
-        total_t = (input_t or 0) + (output_t or 0) if input_t is not None or output_t is not None else None
-        return NormalizedUsage(input_tokens=input_t, output_tokens=output_t, total_tokens=total_t,
-            cache_read_tokens=_as_int(usage.get("cache_read_input_tokens")),
-            cache_creation_tokens=_as_int(usage.get("cache_creation_input_tokens")),
-            native_units=_native_units(usage, exclude={
-                "input_tokens", "output_tokens", "cache_read_input_tokens",
-                "cache_creation_input_tokens",
-            }))
+        return _anthropic_usage(body)
     def extract_model(self, req: Any, resp: Any) -> str | None:
         return _extract_model(req, resp)
+
+
+_OPENAI_USAGE_KEYS = ("prompt_tokens", "completion_tokens", "prompt_tokens_details", "completion_tokens_details")
+
+
+def _partner_usage(body: Any) -> NormalizedUsage | None:
+    """Vertex partner models (Claude, Llama, Mistral, ...) and the OpenAI-
+    compatible endpoints answer in their own vendor's usage shape."""
+    usage = body.get("usage") if isinstance(body, dict) else None
+    if not isinstance(usage, dict):
+        return None
+    if any(key in usage for key in _OPENAI_USAGE_KEYS):
+        return _openai_response_usage(body)
+    return _anthropic_usage(body)
 
 
 def _grounding_units(bodies: Any) -> dict[str, int]:
@@ -308,6 +370,7 @@ def _grounding_units(bodies: Any) -> dict[str, int]:
 
 
 _GOOGLE_MODEL_PATH = re.compile(r"/models/([^/:]+)(?::|$)")
+_VERTEX_PUBLISHER_MODEL = re.compile(r"/publishers/([^/]+)/models/([^/:]+)")
 
 
 class GoogleExtractor:
@@ -322,7 +385,10 @@ class GoogleExtractor:
     def extract_usage(self, body: Any) -> NormalizedUsage | None:
         if not isinstance(body, dict): return None
         meta = body.get("usageMetadata")
-        if not isinstance(meta, dict): return None
+        if not isinstance(meta, dict):
+            # Partner models (publishers/anthropic, publishers/mistralai, ...)
+            # and the OpenAI-compatible endpoints.
+            return _partner_usage(body)
         input_t = _as_int(meta.get("promptTokenCount"))
         # Grounding and tool calls add prompt tokens billed as input.
         tool_t = _as_int(meta.get("toolUsePromptTokenCount"))
@@ -349,25 +415,152 @@ class GoogleExtractor:
             return resp["modelVersion"]
         return None
     def extract_call_model(self, url: str, req: Any, resp: Any) -> str | None:
+        path = urlparse(url).path or ""
+        partner = _VERTEX_PUBLISHER_MODEL.search(path)
+        if partner and partner.group(1) != "google":
+            # The URL names the billed version (claude-sonnet-4-5@20250929);
+            # the response's own model field drops it.
+            return unquote(partner.group(2))
         model = self.extract_model(req, resp)
         if model:
             return model
-        match = _GOOGLE_MODEL_PATH.search(urlparse(url).path or "")
-        return unquote(match.group(1)) if match else None
+        match = _GOOGLE_MODEL_PATH.search(path)
+        if match:
+            return unquote(match.group(1))
+        # OpenAI-compatible endpoints (endpoints/openapi/chat/completions).
+        return _extract_model(req, resp)
 
 
 # ── Additional providers (OpenAI-compatible) ──
 
-def _make_simple_extractor(hostname: str, prov: Provider = Provider.UNKNOWN):
-    class SimpleExtractor:
-        provider = prov
-        def match(self, url: str) -> bool:
-            return (urlparse(url).hostname or "") == hostname
-        def extract_usage(self, body: Any) -> NormalizedUsage | None:
-            return _extract_openai_usage(body)
-        def extract_model(self, req: Any, resp: Any) -> str | None:
-            return _extract_model(req, resp)
-    return SimpleExtractor()
+class OpenAICompatibleExtractor:
+    """An OpenAI-compatible API on its own hosts. Chat/completions,
+    completions, embeddings and responses, JSON or SSE, all report OpenAI
+    usage (with cached and reasoning token details), so the OpenAI
+    extractor's logic prices them."""
+
+    def __init__(self, provider: Provider | str, *hosts: str) -> None:
+        self.provider = provider
+        self.hosts = frozenset(host.lower() for host in hosts)
+
+    def match(self, url: str) -> bool:
+        return _host(url) in self.hosts
+
+    def extract_usage(self, body: Any) -> NormalizedUsage | None:
+        return _openai_response_usage(body)
+
+    def extract_model(self, req: Any, resp: Any) -> str | None:
+        return _extract_model(req, resp)
+
+
+def _make_simple_extractor(hostname: str, prov: Provider = Provider.UNKNOWN) -> OpenAICompatibleExtractor:
+    return OpenAICompatibleExtractor(prov, hostname)
+
+
+_MINIMAX_TTS_PATH = re.compile(r"/t2a_v2/?$")
+
+
+class MiniMaxExtractor(OpenAICompatibleExtractor):
+    """MiniMax chat is OpenAI-compatible; T2A text-to-speech bills the
+    request text's characters and answers with hex audio we never read."""
+
+    def __init__(self) -> None:
+        super().__init__(Provider.MINIMAX, "api.minimax.io", "api.minimaxi.com", "api.minimax.chat")
+
+    def audio_response(self, url: str) -> bool:
+        return bool(_MINIMAX_TTS_PATH.search(urlparse(url).path or ""))
+
+    def extract_call_usage(self, url: str, req: Any, resp: Any, headers: Any) -> NormalizedUsage | None:
+        if self.audio_response(url):
+            characters = _request_text_length(req, "text")
+            return NormalizedUsage(native_units={"characters": characters}) if characters is not None else None
+        return self.extract_usage(resp) if resp else None
+
+
+_SARVAM_TTS_PATH = re.compile(r"^/text-to-speech(?:/stream)?/?$")
+_SARVAM_STT_PATH = re.compile(r"^/speech-to-text(?:-translate)?/?$")
+
+
+class SarvamExtractor(OpenAICompatibleExtractor):
+    """Sarvam chat is OpenAI-compatible; Bulbul TTS bills characters and
+    Saarika/Saaras speech-to-text bills audio seconds."""
+
+    def __init__(self) -> None:
+        super().__init__(Provider.SARVAM, "api.sarvam.ai")
+
+    def audio_response(self, url: str) -> bool:
+        return bool(_SARVAM_TTS_PATH.match(urlparse(url).path or ""))
+
+    def extract_call_model(self, url: str, req: Any, resp: Any) -> str | None:
+        path = urlparse(url).path or ""
+        requested = req.get("model") if isinstance(req, dict) and isinstance(req.get("model"), str) and req["model"] else None
+        if _SARVAM_TTS_PATH.match(path):
+            return requested or "bulbul:v2"
+        if _SARVAM_STT_PATH.match(path):
+            return requested or "saarika:v2.5"
+        return self.extract_model(req, resp)
+
+    def extract_call_usage(self, url: str, req: Any, resp: Any, headers: Any) -> NormalizedUsage | None:
+        path = urlparse(url).path or ""
+        if _SARVAM_TTS_PATH.match(path):
+            characters = None
+            inputs = req.get("inputs") if isinstance(req, dict) else None
+            if isinstance(inputs, list) and inputs:
+                texts = [text for text in inputs if isinstance(text, str)]
+                characters = sum(len(text) for text in texts) if texts else None
+            if characters is None:
+                characters = _request_text_length(req, "text")
+            return NormalizedUsage(native_units={"characters": characters}) if characters is not None else None
+        if _SARVAM_STT_PATH.match(path):
+            seconds = _duration_field(resp)
+            return NormalizedUsage(native_units={"audioSeconds": seconds}) if seconds is not None else None
+        return self.extract_usage(resp) if resp else None
+
+
+_CLOUDFLARE_RUN_PATH = re.compile(r"/ai/run/(.+?)/?$")
+
+
+class CloudflareExtractor(OpenAICompatibleExtractor):
+    """Workers AI: the OpenAI-compatible ``/ai/v1/...`` routes and native
+    ``/ai/run/@cf/...`` calls, whose envelope nests usage under ``result``."""
+
+    def __init__(self) -> None:
+        super().__init__(Provider.CLOUDFLARE, "api.cloudflare.com")
+
+    def match(self, url: str) -> bool:
+        return super().match(url) and "/ai/" in (urlparse(url).path or "")
+
+    def extract_usage(self, body: Any) -> NormalizedUsage | None:
+        result = body.get("result") if isinstance(body, dict) else None
+        if isinstance(result, dict) and isinstance(result.get("usage"), dict):
+            return _openai_response_usage(result)
+        return _openai_response_usage(body)
+
+    def extract_call_model(self, url: str, req: Any, resp: Any) -> str | None:
+        match = _CLOUDFLARE_RUN_PATH.search(urlparse(url).path or "")
+        if match:
+            return unquote(match.group(1))
+        return self.extract_model(req, resp)
+
+
+class OllamaExtractor(OpenAICompatibleExtractor):
+    """A local Ollama server: native ``/api/chat`` and ``/api/generate``
+    (token counts in ``prompt_eval_count``/``eval_count``) and its ``/v1``
+    OpenAI-compatible routes."""
+
+    def __init__(self) -> None:
+        super().__init__(Provider.OLLAMA, "localhost", "127.0.0.1")
+
+    def match(self, url: str) -> bool:
+        try:
+            return super().match(url) and urlparse(url).port == 11434
+        except ValueError:
+            return False
+
+    def extract_usage(self, body: Any) -> NormalizedUsage | None:
+        if isinstance(body, dict) and ("prompt_eval_count" in body or "eval_count" in body):
+            return _token_usage(_first_int(body, "prompt_eval_count"), _first_int(body, "eval_count"))
+        return _openai_response_usage(body)
 
 
 class DeepSeekExtractor:
@@ -488,23 +681,43 @@ class CohereExtractor:
         return (urlparse(url).hostname or "") == "api.cohere.com"
     def extract_usage(self, body: Any) -> NormalizedUsage | None:
         if isinstance(body, dict):
-            meta = body.get("meta")
-            if isinstance(meta, dict):
-                tokens = meta.get("tokens")
-                if isinstance(tokens, dict):
-                    return NormalizedUsage(
-                        input_tokens=_as_int(tokens.get("input_tokens")),
-                        output_tokens=_as_int(tokens.get("output_tokens")),
-                        total_tokens=(
-                            _as_int(tokens.get("input_tokens")) + _as_int(tokens.get("output_tokens"))
-                            if _as_int(tokens.get("input_tokens")) is not None
-                            and _as_int(tokens.get("output_tokens")) is not None
-                            else None
-                        ),
-                        native_units=_native_units(tokens, exclude={"input_tokens", "output_tokens"}))
+            # v1 reports under ``meta``, v2 under ``usage`` (and a stream's
+            # message-end event under ``delta.usage``).
+            delta = body.get("delta")
+            for container in (body.get("meta"), body.get("usage"),
+                              delta.get("usage") if isinstance(delta, dict) else None):
+                usage = _cohere_usage(container)
+                if usage:
+                    return usage
         return _extract_openai_usage(body)
     def extract_model(self, req: Any, resp: Any) -> str | None:
         return _extract_model(req, resp)
+
+
+def _cohere_usage(container: Any) -> NormalizedUsage | None:
+    if not isinstance(container, dict):
+        return None
+    tokens = container.get("tokens") if isinstance(container.get("tokens"), dict) else {}
+    billed = container.get("billed_units") if isinstance(container.get("billed_units"), dict) else {}
+    input_t = _first_int(tokens, "input_tokens")
+    if input_t is None:
+        input_t = _first_int(billed, "input_tokens")
+    output_t = _first_int(tokens, "output_tokens")
+    if output_t is None:
+        output_t = _first_int(billed, "output_tokens")
+    # Rerank bills search units: one per query of up to 100 documents.
+    search_units = _first_int(billed, "search_units")
+    if input_t is None and output_t is None and search_units is None:
+        return None
+    native = _native_units(tokens, exclude={"input_tokens", "output_tokens"})
+    if search_units is not None:
+        native["searchQueries"] = search_units
+    return NormalizedUsage(
+        input_tokens=input_t,
+        output_tokens=output_t,
+        total_tokens=input_t + output_t if input_t is not None and output_t is not None else None,
+        native_units=native,
+    )
 
 
 # ── Non-token providers: speech, search and scraping ──
@@ -526,13 +739,23 @@ _ELEVENLABS_TTS_PATH = re.compile(r"^/v1/text-to-speech/[^/]+(?:/stream)?(?:/wit
 _ELEVENLABS_STT_PATH = re.compile(r"^/v1/speech-to-text/?$")
 
 
-def _transcript_seconds(resp: Any) -> int | float | None:
+def _duration_field(resp: Any) -> int | float | None:
+    """A transcription response's own report of the audio's length."""
     if not isinstance(resp, dict):
         return None
     for key in ("audio_duration_secs", "audio_duration_seconds", "audio_duration", "duration_secs", "duration"):
         value = _as_number(resp.get(key))
         if value is not None and value >= 0:
             return value
+    return None
+
+
+def _transcript_seconds(resp: Any) -> int | float | None:
+    if not isinstance(resp, dict):
+        return None
+    reported = _duration_field(resp)
+    if reported is not None:
+        return reported
     # Without a reported duration, the last word's end time bounds the audio.
     ends = []
     transcripts = resp.get("transcripts") if isinstance(resp.get("transcripts"), list) else [resp]
@@ -703,6 +926,145 @@ class TypesafeExtractor:
         return self.extract_model(req, resp) or "jev-latest"
 
 
+def _query_value(url: str, name: str) -> str | None:
+    values = parse_qs(urlparse(url).query).get(name)
+    return values[0] if values and values[0] else None
+
+
+_DEEPGRAM_LISTEN_PATH = re.compile(r"^/v1/listen/?$")
+_DEEPGRAM_SPEAK_PATH = re.compile(r"^/v1/speak/?$")
+
+
+class DeepgramExtractor:
+    """Pre-recorded speech-to-text bills audio seconds; Aura text-to-speech
+    bills the request text's characters. The model rides in the query."""
+    provider = Provider.DEEPGRAM
+    def match(self, url: str) -> bool:
+        return _host(url) == "api.deepgram.com"
+    def audio_response(self, url: str) -> bool:
+        return bool(_DEEPGRAM_SPEAK_PATH.match(urlparse(url).path or ""))
+    def extract_usage(self, body: Any) -> NormalizedUsage | None:
+        metadata = body.get("metadata") if isinstance(body, dict) else None
+        seconds = _as_number(metadata.get("duration")) if isinstance(metadata, dict) else None
+        return NormalizedUsage(native_units={"audioSeconds": seconds}) if seconds is not None and seconds >= 0 else None
+    def extract_model(self, req: Any, resp: Any) -> str | None:
+        return None
+    def extract_call_model(self, url: str, req: Any, resp: Any) -> str | None:
+        path = urlparse(url).path or ""
+        if _DEEPGRAM_LISTEN_PATH.match(path):
+            return _query_value(url, "model") or "nova-3"
+        return _query_value(url, "model") or "aura-asteria-en"
+    def extract_call_usage(self, url: str, req: Any, resp: Any, headers: Any) -> NormalizedUsage | None:
+        path = urlparse(url).path or ""
+        if _DEEPGRAM_LISTEN_PATH.match(path):
+            return self.extract_usage(resp)
+        if _DEEPGRAM_SPEAK_PATH.match(path):
+            characters = _request_text_length(req, "text")
+            return NormalizedUsage(native_units={"characters": characters}) if characters is not None else None
+        return None
+
+
+_ASSEMBLYAI_TRANSCRIPT_PATH = re.compile(r"^/v2/transcript/[^/]+/?$")
+
+
+class AssemblyAIExtractor:
+    """Async transcription: the audio's duration is known only once a GET of
+    the transcript reports it completed, so that call carries the usage."""
+    provider = Provider.ASSEMBLYAI
+    call_usage_takes_method = True
+    def match(self, url: str) -> bool:
+        return _host(url) in ("api.assemblyai.com", "api.eu.assemblyai.com")
+    def extract_usage(self, body: Any) -> NormalizedUsage | None:
+        return None
+    def extract_model(self, req: Any, resp: Any) -> str | None:
+        for body in (resp, req):
+            if isinstance(body, dict) and isinstance(body.get("speech_model"), str) and body["speech_model"]:
+                return body["speech_model"]
+        return None
+    def extract_call_model(self, url: str, req: Any, resp: Any) -> str | None:
+        if (urlparse(url).path or "").startswith("/v2/transcript"):
+            return self.extract_model(req, resp) or "best"
+        return None
+    def extract_call_usage(self, url: str, req: Any, resp: Any, headers: Any,
+                           method: str | None = None) -> NormalizedUsage | None:
+        if str(method or "").upper() != "GET" or not _ASSEMBLYAI_TRANSCRIPT_PATH.match(urlparse(url).path or ""):
+            return None
+        if not isinstance(resp, dict) or resp.get("status") != "completed":
+            return None
+        seconds = _as_number(resp.get("audio_duration"))
+        return NormalizedUsage(native_units={"audioSeconds": seconds}) if seconds is not None and seconds >= 0 else None
+
+
+_CARTESIA_TTS_PATH = re.compile(r"^/tts/(?:bytes|sse)/?$")
+
+
+class CartesiaExtractor:
+    provider = Provider.CARTESIA
+    def match(self, url: str) -> bool:
+        return _host(url) == "api.cartesia.ai"
+    def audio_response(self, url: str) -> bool:
+        return bool(_CARTESIA_TTS_PATH.match(urlparse(url).path or ""))
+    def extract_usage(self, body: Any) -> NormalizedUsage | None:
+        return None
+    def extract_model(self, req: Any, resp: Any) -> str | None:
+        if isinstance(req, dict) and isinstance(req.get("model_id"), str) and req["model_id"]:
+            return req["model_id"]
+        return None
+    def extract_call_usage(self, url: str, req: Any, resp: Any, headers: Any) -> NormalizedUsage | None:
+        if not self.audio_response(url):
+            return None
+        characters = _request_text_length(req, "transcript")
+        return NormalizedUsage(native_units={"characters": characters}) if characters is not None else None
+
+
+class EmbeddingTokensExtractor:
+    """Embedding and rerank APIs (Voyage, Jina) that report one
+    ``usage.total_tokens`` count, all of it input."""
+    def __init__(self, provider: Provider | str, *hosts: str) -> None:
+        self.provider = provider
+        self.hosts = frozenset(host.lower() for host in hosts)
+    def match(self, url: str) -> bool:
+        return _host(url) in self.hosts
+    def extract_usage(self, body: Any) -> NormalizedUsage | None:
+        usage = body.get("usage") if isinstance(body, dict) else None
+        tokens = _first_int(usage, "total_tokens")
+        return NormalizedUsage(input_tokens=tokens, total_tokens=tokens) if tokens is not None else None
+    def extract_model(self, req: Any, resp: Any) -> str | None:
+        for body in (req, resp):
+            if isinstance(body, dict) and isinstance(body.get("model"), str) and body["model"]:
+                return body["model"]
+        return None
+
+
+class TavilyExtractor:
+    """Search bills per query by depth; every endpoint reports credits when
+    the request asks for usage."""
+    provider = Provider.TAVILY
+    def match(self, url: str) -> bool:
+        return _host(url) == "api.tavily.com"
+    def extract_usage(self, body: Any) -> NormalizedUsage | None:
+        usage = body.get("usage") if isinstance(body, dict) else None
+        credits = _as_number(usage.get("credits")) if isinstance(usage, dict) else None
+        return NormalizedUsage(native_units={"credits": credits}) if credits is not None and credits >= 0 else None
+    def extract_model(self, req: Any, resp: Any) -> str | None:
+        return None
+    def extract_call_model(self, url: str, req: Any, resp: Any) -> str | None:
+        segments = _path_segments(url)
+        endpoint = segments[-1] if segments else None
+        if endpoint == "search":
+            depth = req.get("search_depth") if isinstance(req, dict) else None
+            return "search-advanced" if depth == "advanced" else "search"
+        return endpoint
+    def extract_call_usage(self, url: str, req: Any, resp: Any, headers: Any) -> NormalizedUsage | None:
+        units: dict[str, Any] = {}
+        if self.extract_call_model(url, req, resp) in ("search", "search-advanced"):
+            units["searchQueries"] = 1
+        reported = self.extract_usage(resp)
+        if reported:
+            units.update(reported.native_units)
+        return NormalizedUsage(native_units=units) if units else None
+
+
 # Registry
 _extractors: list[ProviderExtractor] = [
     OpenAIExtractor(),
@@ -725,6 +1087,36 @@ _extractors: list[ProviderExtractor] = [
     _make_simple_extractor("api.fireworks.ai", Provider.FIREWORKS),
     _make_simple_extractor("api.perplexity.ai", Provider.PERPLEXITY),
     _make_simple_extractor("api.cerebras.ai", Provider.CEREBRAS),
+    OpenAICompatibleExtractor(Provider.DEEPINFRA, "api.deepinfra.com"),
+    OpenAICompatibleExtractor(Provider.NVIDIA, "integrate.api.nvidia.com"),
+    OpenAICompatibleExtractor(Provider.SAMBANOVA, "api.sambanova.ai"),
+    OpenAICompatibleExtractor(Provider.NOVITA, "api.novita.ai"),
+    OpenAICompatibleExtractor(Provider.HYPERBOLIC, "api.hyperbolic.xyz"),
+    OpenAICompatibleExtractor(Provider.NEBIUS, "api.studio.nebius.com", "api.studio.nebius.ai",
+                              "api.tokenfactory.nebius.com"),
+    OpenAICompatibleExtractor(Provider.ALIBABA, "dashscope.aliyuncs.com", "dashscope-intl.aliyuncs.com",
+                              "dashscope-us.aliyuncs.com"),
+    OpenAICompatibleExtractor(Provider.MOONSHOT, "api.moonshot.ai", "api.moonshot.cn"),
+    OpenAICompatibleExtractor(Provider.ZAI, "api.z.ai", "open.bigmodel.cn"),
+    MiniMaxExtractor(),
+    OpenAICompatibleExtractor(Provider.HUGGINGFACE, "router.huggingface.co", "api-inference.huggingface.co"),
+    OpenAICompatibleExtractor(Provider.BASETEN, "inference.baseten.co"),
+    OpenAICompatibleExtractor(Provider.LAMBDA, "api.lambda.ai"),
+    OpenAICompatibleExtractor(Provider.FEATHERLESS, "api.featherless.ai"),
+    OpenAICompatibleExtractor(Provider.FRIENDLI, "api.friendli.ai"),
+    OpenAICompatibleExtractor(Provider.AI21, "api.ai21.com"),
+    OpenAICompatibleExtractor(Provider.UPSTAGE, "api.upstage.ai"),
+    SarvamExtractor(),
+    CloudflareExtractor(),
+    OpenAICompatibleExtractor(Provider.VERCEL, "ai-gateway.vercel.sh"),
+    OllamaExtractor(),
+    # Speech, embeddings and search
+    DeepgramExtractor(),
+    AssemblyAIExtractor(),
+    CartesiaExtractor(),
+    EmbeddingTokensExtractor(Provider.VOYAGE, "api.voyageai.com"),
+    EmbeddingTokensExtractor(Provider.JINA, "api.jina.ai"),
+    TavilyExtractor(),
     # AI proxies/gateways
     _make_simple_extractor("api.portkey.ai", Provider.OPENAI),
     _make_simple_extractor("oai.helicone.ai", Provider.OPENAI),

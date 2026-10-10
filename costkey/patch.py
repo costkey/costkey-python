@@ -19,7 +19,9 @@ from contextvars import ContextVar
 from typing import Any, Callable, Iterator, AsyncIterator
 from urllib.parse import parse_qsl, quote, urlsplit, urlunsplit
 from costkey.types import CostKeyEvent, NormalizedUsage, StreamTiming, Provider
-from costkey.providers import BedrockExtractor, call_model, call_usage, find_extractor, merge_usage
+from costkey.providers import (
+    BedrockExtractor, call_model, call_usage, find_extractor, is_audio_response, merge_usage,
+)
 from costkey.stack import capture_call_site
 from costkey.transport import Transport
 
@@ -73,6 +75,12 @@ def _is_binary_response(headers: Any) -> bool:
     return _content_type(headers).startswith(_BINARY_TYPES)
 
 
+def _reads_body(extractor: Any, url: str, headers: Any) -> bool:
+    """Whether a response may be read for usage: never audio, whether sent as
+    audio bytes or wrapped in JSON (base64 or hex)."""
+    return not _is_binary_response(headers) and not is_audio_response(extractor, url)
+
+
 def _is_event_stream(headers: Any, url: str) -> bool:
     content_type = _content_type(headers)
     if content_type:
@@ -83,7 +91,7 @@ def _is_event_stream(headers: Any, url: str) -> bool:
 
 def _is_stream_response(headers: Any) -> bool:
     content_type = _content_type(headers)
-    return content_type.startswith("text/event-stream") or content_type.startswith(_EVENT_STREAM_TYPE)
+    return content_type.startswith(("text/event-stream", "application/x-ndjson", _EVENT_STREAM_TYPE))
 
 
 def _json_safe(value: Any, depth: int = 0) -> Any:
@@ -758,7 +766,7 @@ def start_runtime_config_fetch(
     worker.start()
 
 
-_STREAM_PATH = re.compile(r"(:streamGenerateContent$|/invoke-with-response-stream$|/converse-stream$)")
+_STREAM_PATH = re.compile(r"(:streamGenerateContent$|:streamRawPredict$|/invoke-with-response-stream$|/converse-stream$)")
 
 
 def _is_streaming_request(request_body: Any, url: str | None = None) -> bool:
@@ -789,6 +797,21 @@ def _sse_bodies(text: str) -> list[dict[str, Any]]:
             continue
         try:
             parsed = json.loads(data)
+        except Exception:
+            continue
+        if isinstance(parsed, dict):
+            bodies.append(parsed)
+    return bodies
+
+
+def _ndjson_bodies(text: str) -> list[dict[str, Any]]:
+    bodies: list[dict[str, Any]] = []
+    for line in text.split("\n"):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            parsed = json.loads(line)
         except Exception:
             continue
         if isinstance(parsed, dict):
@@ -962,6 +985,9 @@ def _stream_summary(data: bytes, extractor: Any, url: str, request_body: Any, he
             parsed = None
         body = parsed if isinstance(parsed, dict) else None
         bodies = [item for item in (parsed if isinstance(parsed, list) else [parsed]) if isinstance(item, dict)]
+        if parsed is None:
+            # Newline-delimited JSON (Ollama's native streams).
+            bodies = _ndjson_bodies(text)
     model = None
     for item in bodies:
         try:
@@ -1361,7 +1387,9 @@ class _StreamRecorder:
         self.settlement_async = settlement_async
         self.capture_body = capture_body
         # Audio and other media carry no usage; count them, don't keep them.
-        self.buffering = _is_event_stream(headers, url) or not _is_binary_response(headers)
+        self.buffering = (
+            _is_event_stream(headers, url) or not _is_binary_response(headers)
+        ) and not is_audio_response(extractor, url)
         self.buffer = bytearray()
         self.usage: NormalizedUsage | None = None
         self.first_chunk_time: float | None = None
@@ -1426,7 +1454,7 @@ class _StreamRecorder:
             if streamed:
                 usage = merge_usage(usage, streamed)
         called = call_usage(self.extractor, self.url, self.request_body, body,
-                            self.headers, self.status_code)
+                            self.headers, self.status_code, self.method)
         if called:
             usage = merge_usage(usage, called)
 
@@ -1572,13 +1600,13 @@ def _patch_httpx() -> None:
                 # Non-streaming — read body normally
                 duration_ms = (time.perf_counter() - start) * 1000
                 response_body = None
-                if not _is_binary_response(response.headers):
+                if _reads_body(extractor, url, response.headers):
                     try:
                         response_body = response.json()
                     except Exception:
                         pass
                 usage = call_usage(extractor, url, request_body, response_body,
-                                   response.headers, response.status_code)
+                                   response.headers, response.status_code, request.method)
                 _process(extractor, url, request.method, response.status_code,
                          request_body, response_body, duration_ms,
                          False, None, call_site, ctx, event_id=event_id,
@@ -1648,13 +1676,13 @@ def _patch_httpx() -> None:
             else:
                 duration_ms = (time.perf_counter() - start) * 1000
                 response_body = None
-                if not _is_binary_response(response.headers):
+                if _reads_body(extractor, url, response.headers):
                     try:
                         response_body = response.json()
                     except Exception:
                         pass
                 usage = call_usage(extractor, url, request_body, response_body,
-                                   response.headers, response.status_code)
+                                   response.headers, response.status_code, request.method)
                 _process(extractor, url, request.method, response.status_code,
                          request_body, response_body, duration_ms,
                          False, None, call_site, ctx, event_id=event_id,
@@ -1840,13 +1868,13 @@ def _patch_requests() -> None:
 
             duration_ms = (time.perf_counter() - start) * 1000
             response_body = None
-            if not _is_binary_response(response.headers):
+            if _reads_body(extractor, url, response.headers):
                 try:
                     response_body = response.json()
                 except Exception:
                     response_body = None
             usage = call_usage(extractor, url, request_body, response_body,
-                               response.headers, response.status_code)
+                               response.headers, response.status_code, request.method)
 
             _process(extractor, url, request.method, response.status_code,
                      request_body, response_body, duration_ms,
@@ -2002,6 +2030,20 @@ def _params_request_sse(params: Any) -> bool:
         return False
 
 
+def _url_with_params(url: str, params: Any) -> str:
+    """aiohttp sends ``params=`` separately; some providers (Deepgram) name
+    the model in the query."""
+    if not params:
+        return url
+    try:
+        from yarl import URL
+        built = URL(url)
+        extend = getattr(built, "extend_query", None) or built.update_query
+        return str(extend(params))
+    except Exception:
+        return url
+
+
 def _patch_aiohttp() -> None:
     try:
         import aiohttp
@@ -2043,6 +2085,7 @@ def _aiohttp_call(session: Any, method: str, str_or_url: Any, kwargs: dict[str, 
         url = str(session._build_url(str_or_url))
     except Exception:
         url = str(str_or_url)
+    url = _url_with_params(url, kwargs.get("params"))
     extractor = find_extractor(url)
     if not extractor or url.startswith(("ws://", "wss://")):
         return None
@@ -2104,7 +2147,7 @@ async def _observe_aiohttp_response(response: Any, call: dict[str, Any],
         return
 
     response_body = None
-    if not _is_binary_response(headers):
+    if _reads_body(call["extractor"], call["url"], headers):
         try:
             # aiohttp caches the body for read()/text()/json(); direct
             # ``content`` readers get a replay of it.
@@ -2119,7 +2162,8 @@ async def _observe_aiohttp_response(response: Any, call: dict[str, Any],
             except Exception:
                 response_body = None
     duration_ms = (time.perf_counter() - call["start"]) * 1000
-    usage = call_usage(call["extractor"], call["url"], call["request_body"], response_body, headers, status)
+    usage = call_usage(call["extractor"], call["url"], call["request_body"], response_body,
+                       headers, status, call["method"])
     _process(call["extractor"], call["url"], call["method"], status,
              call["request_body"], response_body, duration_ms,
              False, None, call["call_site"], call["ctx"], event_id=call["event_id"],
@@ -2292,7 +2336,7 @@ def _bedrock_api_call(original: Any, client: Any, operation_name: str, path: str
                         response_body = None
         else:
             response_body = _json_safe({k: v for k, v in response.items() if k != "ResponseMetadata"})
-        usage = call_usage(_BEDROCK, url, request_body, response_body, headers, status)
+        usage = call_usage(_BEDROCK, url, request_body, response_body, headers, status, "POST")
         _process(_BEDROCK, url, "POST", status, request_body, response_body,
                  (time.perf_counter() - start) * 1000, False, None, call_site, ctx,
                  event_id=event_id, provider_request_id=request_id,
@@ -2335,7 +2379,7 @@ def _process(extractor: Any, url: str, method: str, status_code: int | None,
         if ctx.get("costkeyCapture") in {"manual", "explicit", "disabled"}:
             return
         if usage is _UNSET:
-            usage = call_usage(extractor, url, request_body, response_body, response_headers, status_code)
+            usage = call_usage(extractor, url, request_body, response_body, response_headers, status_code, method)
         model = model or call_model(extractor, url, request_body, response_body)
 
         response_charge_id = provider_request_id
