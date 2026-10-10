@@ -20,6 +20,11 @@ class Provider(str, Enum):
     CEREBRAS = "cerebras"
     OPENROUTER = "openrouter"
     BEDROCK = "bedrock"
+    ELEVENLABS = "elevenlabs"
+    RUMIK = "rumik"
+    EXA = "exa"
+    FIRECRAWL = "firecrawl"
+    TYPESAFE = "typesafe"
     UNKNOWN = "unknown"
 
 

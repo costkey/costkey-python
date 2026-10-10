@@ -17,7 +17,7 @@ Your provider dashboard says you spent $2,000. CostKey tells you `generate_summa
 
 ## Why CostKey
 
-Most AI observability tools make you route traffic through a proxy or wrap every provider client. CostKey instruments supported `httpx` and `requests` calls in-process, detects configured AI provider endpoints, captures useful metadata, and ships events asynchronously to the CostKey dashboard.
+Most AI observability tools make you route traffic through a proxy or wrap every provider client. CostKey instruments supported `httpx`, `requests`, `aiohttp` and boto3/botocore Bedrock calls in-process, detects configured AI provider endpoints, captures useful metadata, and ships events asynchronously to the CostKey dashboard.
 
 - **No extra provider-routing hop** - provider traffic stays on its existing path; CostKey adds local interception and asynchronous telemetry. Explicit enforcement performs a separate admission decision.
 - **No provider-client wrappers** - keep using OpenAI, Anthropic, Gemini, LangChain, LiteLLM, or your own gateway.
@@ -51,7 +51,8 @@ costkey.init(dsn=os.environ["COSTKEY_DSN"])
 ```
 
 Initialize CostKey before your first AI call. After that, supported provider
-calls made through `httpx` or `requests` are tracked automatically.
+calls made through `httpx`, `requests`, `aiohttp` (google-genai uses it when
+installed) or boto3 `bedrock-runtime` clients are tracked automatically.
 
 ## No-Code Bootstrap
 
@@ -93,7 +94,7 @@ Captured provider events can include:
 - Flask
 - plain Python scripts and services
 
-CostKey works with provider clients that use `httpx` or `requests` under the hood.
+CostKey works with provider clients that use `httpx`, `requests` or `aiohttp` under the hood, and with boto3/botocore `bedrock-runtime` clients.
 
 ## Traces and Context
 
@@ -225,14 +226,18 @@ outbound URLs.
 
 ## Streaming
 
-Streaming responses are fully supported. The SDK wraps `httpx` response iteration to capture:
+Streaming responses are fully supported. The SDK records the bytes your code
+reads from `httpx`, `requests` and `aiohttp` streams (and the events of boto3
+Bedrock streams) without buffering ahead of you, and captures:
 
 - TTFT, time to first token
 - output tokens per second
 - stream duration
-- final usage chunks when providers emit them
+- usage merged across SSE chunks, Gemini JSON streams and AWS event streams
+  (Bedrock `converse-stream` / `invoke-with-response-stream`)
 
-Non-AI HTTP calls pass through untouched.
+A stream your code stops reading early is reported when the response is
+closed or released. Non-AI HTTP calls pass through untouched.
 
 ## Privacy
 
@@ -266,7 +271,22 @@ costkey.init(
 
 ## Providers
 
-Built-in detection covers OpenAI, Anthropic, Google Gemini, Google Vertex AI, Azure OpenAI, Groq, xAI, Mistral, DeepSeek, Cohere, Together, Fireworks, Perplexity, Cerebras, OpenRouter, and AWS Bedrock.
+Built-in detection covers OpenAI, Anthropic, Google Gemini, Google Vertex AI, Azure OpenAI, Groq, xAI, Mistral, DeepSeek, Cohere, Together, Fireworks, Perplexity, Cerebras, OpenRouter, AWS Bedrock, ElevenLabs, Rumik, Exa, Firecrawl, and TypeSafe.
+
+Calls that are not billed per token report provider-native units in
+`usage.nativeUnits`, and provider-reported amounts in `usage.costUsd`:
+
+| Provider | Units |
+| --- | --- |
+| Gemini / Vertex grounding | `searchQueries` (distinct executed queries), `groundingRequests`, `mapsGroundingRequests` |
+| ElevenLabs text-to-speech | `characters` (the `character-cost` header when present, else the request text) |
+| ElevenLabs speech-to-text | `audioSeconds` |
+| Rumik | `characters` |
+| Exa | `searchQueries` and `searchResults` (search, find-similar), `pages` (contents), `costUsd` from `costDollars.total` |
+| Firecrawl | `credits` (reported `creditsUsed`; scrape and map default to 1), `searchQueries`/`searchResults` for search |
+
+Firecrawl job status polls (`/v2/crawl/{id}` and similar) are recorded without
+credits, since each poll repeats the job's running total.
 
 Add your own provider or internal gateway:
 
@@ -314,7 +334,7 @@ costkey.register_extractor(InternalGatewayExtractor())
 ## Development
 
 ```bash
-python -m pip install -e . pytest build twine
+python -m pip install -e ".[test]" build twine
 python -m pytest
 python -m build
 python -m twine check dist/*

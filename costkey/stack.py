@@ -20,6 +20,10 @@ _INTERNAL = (
     "site-packages/httpcore",
     "site-packages/requests",
     "site-packages/urllib3",
+    "site-packages/aiohttp",
+    "site-packages/botocore",
+    "site-packages/boto3",
+    "site-packages/aiobotocore",
     # AI SDKs (internal transport)
     "site-packages/openai",
     "site-packages/anthropic",

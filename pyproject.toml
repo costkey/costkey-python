@@ -27,6 +27,9 @@ dependencies = [
     "httpx>=0.24.0",
 ]
 
+[project.optional-dependencies]
+test = ["pytest", "aiohttp", "botocore", "requests"]
+
 [project.scripts]
 costkey = "costkey.cli:main"
 

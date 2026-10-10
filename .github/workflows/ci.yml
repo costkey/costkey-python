@@ -28,7 +28,7 @@ jobs:
           cache: pip
 
       - name: Install package and test tools
-        run: python -m pip install -e . pytest build twine
+        run: python -m pip install -e ".[test]" build twine
 
       - name: Test
         run: python -m pytest

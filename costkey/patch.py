@@ -1,11 +1,15 @@
 """Monkey-patch HTTP clients to intercept AI provider calls."""
 from __future__ import annotations
-import dataclasses
+import asyncio
+import base64
 import json
 import datetime
+import io
 import math
+import struct
 import time
 import uuid
+import weakref
 import re
 import logging
 import functools
@@ -13,9 +17,9 @@ import inspect
 import threading
 from contextvars import ContextVar
 from typing import Any, Callable, Iterator, AsyncIterator
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import parse_qsl, quote, urlsplit, urlunsplit
 from costkey.types import CostKeyEvent, NormalizedUsage, StreamTiming, Provider
-from costkey.providers import find_extractor
+from costkey.providers import BedrockExtractor, call_model, call_usage, find_extractor, merge_usage
 from costkey.stack import capture_call_site
 from costkey.transport import Transport
 
@@ -46,6 +50,139 @@ _ADMISSION_CONTEXT_KEYS = frozenset({
 _CONTEXT_HEADER = "x-costkey-context"
 _TRACE_ID_HEADER = "x-costkey-trace-id"
 _TRACE_NAME_HEADER = "x-costkey-trace-name"
+_CARRIER_HEADERS = frozenset({_CONTEXT_HEADER, _TRACE_ID_HEADER, _TRACE_NAME_HEADER})
+_EVENT_STREAM_TYPE = "application/vnd.amazon.eventstream"
+_BINARY_TYPES = ("audio/", "video/", "image/", "application/octet-stream")
+_BLOB_MIN_CHARS = 16_384
+_BASE64_BLOB = re.compile(r"(?:data:[\w/+.-]+;base64,)?[A-Za-z0-9+/=_-]+")
+_MULTIPART_FIELD = re.compile(
+    rb'content-disposition: form-data; name="([^"]+)"\r\n(?:[^\r\n]+\r\n)*\r\n(.{0,4096}?)\r\n--',
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _content_type(headers: Any) -> str:
+    try:
+        return str(headers.get("content-type") or "").lower() if headers is not None else ""
+    except Exception:
+        return ""
+
+
+def _is_binary_response(headers: Any) -> bool:
+    """Audio/image bodies carry no usage; never buffer or JSON-parse them."""
+    return _content_type(headers).startswith(_BINARY_TYPES)
+
+
+def _is_event_stream(headers: Any, url: str) -> bool:
+    content_type = _content_type(headers)
+    if content_type:
+        return content_type.startswith(_EVENT_STREAM_TYPE)
+    path = urlsplit(url).path
+    return path.endswith("/invoke-with-response-stream") or path.endswith("/converse-stream")
+
+
+def _is_stream_response(headers: Any) -> bool:
+    content_type = _content_type(headers)
+    return content_type.startswith("text/event-stream") or content_type.startswith(_EVENT_STREAM_TYPE)
+
+
+def _json_safe(value: Any, depth: int = 0) -> Any:
+    """Keep captured bodies serializable and small: bytes, non-finite floats
+    and inline base64 media (audio, images) never go on the wire."""
+    if value is None or isinstance(value, (bool, int)):
+        return value
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, str):
+        if len(value) >= _BLOB_MIN_CHARS and _BASE64_BLOB.fullmatch(value[:4096]):
+            return f"[omitted {len(value)} chars]"
+        return value
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return f"[{len(value)} bytes]"
+    if depth > 64:
+        return None
+    if isinstance(value, dict):
+        return {str(key): _json_safe(item, depth + 1) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item, depth + 1) for item in value]
+    if isinstance(value, (datetime.datetime, datetime.date)):
+        return value.isoformat()
+    return f"[{type(value).__name__}]"
+
+
+def _form_fields(raw: Any, content_type: str | None = None) -> dict[str, Any] | None:
+    """Plain (non-file) form fields, e.g. ``model_id`` on an upload."""
+    fields: dict[str, Any] = {}
+    if isinstance(raw, dict):
+        fields = {str(key): value for key, value in raw.items() if isinstance(value, (str, int, float, bool))}
+    elif isinstance(getattr(raw, "_fields", None), list):  # aiohttp.FormData
+        for item in raw._fields:
+            if isinstance(item, tuple) and len(item) == 3:
+                options, _headers, value = item
+                if isinstance(value, str) and not options.get("filename") and options.get("name"):
+                    fields[str(options["name"])] = value
+    elif isinstance(getattr(raw, "fields", None), list):  # httpx MultipartStream
+        for field in raw.fields:
+            value = getattr(field, "value", None)
+            if not hasattr(field, "filename") and isinstance(value, (str, bytes)):
+                fields[field.name] = value.decode("utf-8", "replace") if isinstance(value, bytes) else value
+    elif isinstance(raw, (bytes, bytearray, str)):
+        data = raw.encode("utf-8") if isinstance(raw, str) else bytes(raw)
+        kind = (content_type or "").lower()
+        if "multipart/form-data" in kind:
+            for match in _MULTIPART_FIELD.finditer(data):
+                fields[match.group(1).decode("utf-8", "replace")] = match.group(2).decode("utf-8", "replace")
+        elif "application/x-www-form-urlencoded" in kind:
+            fields = dict(parse_qsl(data.decode("utf-8", "replace")))
+    return fields or None
+
+
+def _decode_request_body(raw: Any, content_type: str | None = None) -> Any:
+    if raw is None:
+        return None
+    if isinstance(raw, (bytes, bytearray, str)):
+        try:
+            return json.loads(raw)
+        except Exception:
+            pass
+    try:
+        return _form_fields(raw, content_type)
+    except Exception:
+        return None
+
+
+def _httpx_request_bytes(request: Any) -> bytes | None:
+    # A multipart upload is a stream that has not been read yet.
+    try:
+        return request.content
+    except Exception:
+        return None
+
+
+def _without_carrier_headers(headers: Any) -> Any:
+    try:
+        items = list(headers.items())
+    except Exception:
+        return headers
+    if not any(str(key).lower() in _CARRIER_HEADERS for key, _value in items):
+        return headers
+    kept = [(key, value) for key, value in items if str(key).lower() not in _CARRIER_HEADERS]
+    try:
+        from multidict import CIMultiDict
+        return CIMultiDict(kept)
+    except ImportError:
+        return dict(kept)
+
+
+def _lower_headers(headers: Any) -> Any:
+    """A case-insensitive view for plain-dict request headers."""
+    if headers is None or hasattr(headers, "getall"):
+        return headers
+    try:
+        items = headers.items() if hasattr(headers, "items") else headers
+        return {str(key).lower(): value for key, value in items}
+    except Exception:
+        return None
 
 
 def _scrub(obj: Any) -> Any:
@@ -424,6 +561,8 @@ class _PatchState:
         self._original_httpx_send: Any = None
         self._original_httpx_async_send: Any = None
         self._original_requests_send: Any = None
+        self._original_aiohttp_request: Any = None
+        self._original_botocore_call: Any = None
         self.patched = False
 
 
@@ -456,6 +595,8 @@ def patch(transport: Transport, project_id: str, capture_body: bool | None,
     _state.admission_mode = admission_mode
     _patch_httpx()
     _patch_requests()
+    _patch_aiohttp()
+    _patch_botocore()
     _state.patched = True
 
 
@@ -466,6 +607,8 @@ def unpatch() -> None:
     _state.config_generation += 1
     _unpatch_httpx()
     _unpatch_requests()
+    _unpatch_aiohttp()
+    _unpatch_botocore()
     _state.patched = False
     _state.transport = None
     _state.before_send = None
@@ -635,15 +778,8 @@ def _is_streaming_request(request_body: Any, url: str | None = None) -> bool:
     return False
 
 
-def _extract_sse_usage(text: str, extractor: Any) -> NormalizedUsage | None:
-    """Merge usage across a whole SSE stream.
-
-    OpenAI chat reports usage in the final chunk, the Responses API under
-    ``response.completed``'s ``response``, Anthropic input in ``message_start``
-    and output in ``message_delta``, Gemini cumulatively on every chunk. Each
-    field keeps its largest reported value, which is correct for all of them.
-    """
-    merged: NormalizedUsage | None = None
+def _sse_bodies(text: str) -> list[dict[str, Any]]:
+    bodies: list[dict[str, Any]] = []
     for raw in text.split("\n"):
         line = raw.lstrip()
         if not line.startswith("data:"):
@@ -655,8 +791,14 @@ def _extract_sse_usage(text: str, extractor: Any) -> NormalizedUsage | None:
             parsed = json.loads(data)
         except Exception:
             continue
-        if not isinstance(parsed, dict):
-            continue
+        if isinstance(parsed, dict):
+            bodies.append(parsed)
+    return bodies
+
+
+def _stream_bodies_usage(bodies: list[dict[str, Any]], extractor: Any) -> NormalizedUsage | None:
+    merged: NormalizedUsage | None = None
+    for parsed in bodies:
         for candidate in (parsed, parsed.get("response"), parsed.get("message")):
             if not isinstance(candidate, dict):
                 continue
@@ -665,35 +807,31 @@ def _extract_sse_usage(text: str, extractor: Any) -> NormalizedUsage | None:
             except Exception:
                 usage = None
             if usage:
-                merged = _merge_usage(merged, usage)
+                merged = merge_usage(merged, usage)
+    stream_units = getattr(extractor, "extract_stream_units", None)
+    if callable(stream_units):
+        try:
+            units = stream_units(bodies)
+        except Exception:
+            units = None
+        if units:
+            merged = merged or NormalizedUsage()
+            merged.native_units = {**(merged.native_units or {}), **units}
     if merged and merged.total_tokens is None and merged.input_tokens is not None and merged.output_tokens is not None:
         merged.total_tokens = merged.input_tokens + merged.output_tokens
     return merged
 
 
-def _merge_usage(current: NormalizedUsage | None, nxt: NormalizedUsage) -> NormalizedUsage:
-    if current is None:
-        return dataclasses.replace(nxt)
+def _extract_sse_usage(text: str, extractor: Any) -> NormalizedUsage | None:
+    """Merge usage across a whole SSE stream.
 
-    def pick(a: Any, b: Any) -> Any:
-        if a is None:
-            return b
-        if b is None:
-            return a
-        return max(a, b)
+    OpenAI chat reports usage in the final chunk, the Responses API under
+    ``response.completed``'s ``response``, Anthropic input in ``message_start``
+    and output in ``message_delta``, Gemini cumulatively on every chunk. Each
+    field keeps its largest reported value, which is correct for all of them.
+    """
+    return _stream_bodies_usage(_sse_bodies(text), extractor)
 
-    merged = dataclasses.replace(current)
-    for name in ("input_tokens", "output_tokens", "reasoning_tokens", "cache_read_tokens",
-                 "cache_creation_tokens", "cost_usd", "image_output_tokens"):
-        if hasattr(merged, name):
-            setattr(merged, name, pick(getattr(current, name, None), getattr(nxt, name, None)))
-    total = pick(current.total_tokens, nxt.total_tokens)
-    if merged.input_tokens is not None and merged.output_tokens is not None:
-        total = max(total or 0, merged.input_tokens + merged.output_tokens)
-    merged.total_tokens = total
-    if getattr(nxt, "native_units", None) or getattr(current, "native_units", None):
-        merged.native_units = {**(getattr(current, "native_units", None) or {}), **(getattr(nxt, "native_units", None) or {})}
-    return merged
 
 
 def _extract_sse_model(text: str, request_body: Any, extractor: Any) -> str | None:
@@ -713,24 +851,131 @@ def _extract_sse_model(text: str, request_body: Any, extractor: Any) -> str | No
     return None
 
 
-def _extract_sse_provider_request_id(text: str) -> str | None:
-    for line in text.split("\n"):
-        if not line.startswith("data: "):
-            continue
-        data = line[6:].strip()
-        if data == "[DONE]":
+_EVENT_HEADER_SIZES = {2: 1, 3: 2, 4: 4, 5: 8, 8: 8, 9: 16}
+
+
+def _event_stream_headers(raw: bytes) -> dict[str, Any]:
+    headers: dict[str, Any] = {}
+    i = 0
+    while i < len(raw):
+        name_length = raw[i]
+        name = raw[i + 1:i + 1 + name_length].decode("utf-8", "replace")
+        i += 1 + name_length
+        kind = raw[i]
+        i += 1
+        if kind in (0, 1):
+            value: Any = kind == 0
+        elif kind in (6, 7):
+            (length,) = struct.unpack_from(">H", raw, i)
+            value = raw[i + 2:i + 2 + length]
+            i += 2 + length
+            if kind == 7:
+                value = value.decode("utf-8", "replace")
+        elif kind in _EVENT_HEADER_SIZES:
+            value = raw[i:i + _EVENT_HEADER_SIZES[kind]]
+            i += _EVENT_HEADER_SIZES[kind]
+        else:
+            break
+        headers[name] = value
+    return headers
+
+
+def _decode_event_stream(data: bytes) -> list[tuple[dict[str, Any], bytes]]:
+    """Split an AWS event stream into (headers, payload) messages.
+
+    Each message is [total length u32][headers length u32][prelude crc u32]
+    [headers][payload][message crc u32], big-endian.
+    """
+    messages: list[tuple[dict[str, Any], bytes]] = []
+    offset = 0
+    while offset + 16 <= len(data):
+        total, headers_length = struct.unpack_from(">II", data, offset)
+        end = offset + total
+        if total < 16 or end > len(data) or 16 + headers_length > total:
+            break
+        try:
+            headers = _event_stream_headers(data[offset + 12:offset + 12 + headers_length])
+        except Exception:
+            headers = {}
+        messages.append((headers, data[offset + 12 + headers_length:end - 4]))
+        offset = end
+    return messages
+
+
+def _bedrock_payload_usage(payload: Any, extractor: Any) -> NormalizedUsage | None:
+    """Usage in one Bedrock stream event: Converse ``metadata`` events, or
+    InvokeModel ``chunk`` events whose bytes hold the model's own JSON."""
+    if not isinstance(payload, dict):
+        return None
+    if isinstance(payload.get("chunk"), dict):
+        payload = payload["chunk"]
+    blob = payload.get("bytes")
+    if isinstance(blob, (str, bytes, bytearray)):
+        try:
+            payload = json.loads(base64.b64decode(blob) if isinstance(blob, str) else bytes(blob))
+        except Exception:
+            return None
+        if not isinstance(payload, dict):
+            return None
+    merged: NormalizedUsage | None = None
+    for candidate in (payload, payload.get("message"), payload.get("metadata")):
+        if not isinstance(candidate, dict):
             continue
         try:
-            parsed = json.loads(data)
+            usage = extractor.extract_usage(candidate)
+        except Exception:
+            usage = None
+        if usage:
+            merged = merge_usage(merged, usage)
+    return merged
+
+
+def _extract_event_stream_usage(data: bytes, extractor: Any) -> NormalizedUsage | None:
+    merged: NormalizedUsage | None = None
+    for headers, payload in _decode_event_stream(data):
+        if headers.get(":message-type", "event") != "event":
+            continue
+        try:
+            parsed = json.loads(payload)
         except Exception:
             continue
-        if not isinstance(parsed, dict):
-            continue
-        for key in ("id", "request_id", "requestId", "response_id", "responseId"):
-            value = parsed.get(key)
-            if isinstance(value, str) and value:
-                return value
-    return None
+        usage = _bedrock_payload_usage(parsed, extractor)
+        if usage:
+            merged = merge_usage(merged, usage)
+    return merged
+
+
+def _stream_summary(data: bytes, extractor: Any, url: str, request_body: Any, headers: Any
+                    ) -> tuple[NormalizedUsage | None, str | None, str | None, dict[str, Any] | None]:
+    """Usage, model, provider request id and (for a plain JSON body read
+    through a streaming API) the parsed body, from a whole streamed response."""
+    if _is_event_stream(headers, url):
+        return _extract_event_stream_usage(data, extractor), None, None, None
+    text = data.decode("utf-8", errors="replace")
+    bodies = _sse_bodies(text)
+    body = None
+    if not bodies:
+        # Gemini without alt=sse streams a single JSON array of chunks.
+        try:
+            parsed = json.loads(text)
+        except Exception:
+            parsed = None
+        body = parsed if isinstance(parsed, dict) else None
+        bodies = [item for item in (parsed if isinstance(parsed, list) else [parsed]) if isinstance(item, dict)]
+    model = None
+    for item in bodies:
+        try:
+            model = extractor.extract_model(request_body, item)
+        except Exception:
+            model = None
+        if model:
+            break
+    request_id = next((
+        item[key] for item in bodies
+        for key in ("id", "request_id", "requestId", "response_id", "responseId")
+        if isinstance(item.get(key), str) and item[key]
+    ), None)
+    return _stream_bodies_usage(bodies, extractor), model, request_id, body
 
 
 def _policy_refusal(reason: str, details: dict[str, Any] | None = None) -> Exception:
@@ -1071,6 +1316,197 @@ async def _settle_async(
                 logger.warning("[costkey] policy settlement unavailable; reservation remains pending")
 
 
+def _admission_payload(event_id: str, extractor: Any, url: str, request_body: Any,
+                       raw_body: Any, ctx: dict[str, Any], streaming: bool) -> dict[str, Any]:
+    return {
+        "id": event_id,
+        "admissionId": event_id,
+        "requestId": event_id,
+        "projectId": _state.project_id,
+        "provider": _provider_value(extractor.provider),
+        "model": call_model(extractor, url, request_body, None),
+        "context": _safe_admission_context(ctx),
+        # Admission deliberately receives metadata only; request
+        # bodies and credentials never leave the application here.
+        "usageBounds": _estimate_request_usage(request_body, raw_body),
+        "streaming": streaming,
+    }
+
+
+# ── Streamed responses ──
+
+class _StreamRecorder:
+    """Records one streamed provider response and emits its call event once.
+
+    Clients feed it the bytes (or typed events) the caller consumes; it emits
+    when the stream ends, or when the caller stops early and closes it.
+    """
+
+    def __init__(self, extractor: Any, url: str, method: str, request_body: Any,
+                 start: float, call_site: Any, ctx: dict[str, Any], *,
+                 status_code: int | None = None, headers: Any = None,
+                 event_id: str | None = None, admission_decision: dict[str, Any] | None = None,
+                 settlement_async: bool = False, capture_body: bool | None = None) -> None:
+        self.extractor = extractor
+        self.url = url
+        self.method = method
+        self.request_body = request_body
+        self.start = start
+        self.call_site = call_site
+        self.ctx = ctx
+        self.status_code = status_code
+        self.headers = headers
+        self.event_id = event_id
+        self.admission_decision = admission_decision
+        self.settlement_async = settlement_async
+        self.capture_body = capture_body
+        # Audio and other media carry no usage; count them, don't keep them.
+        self.buffering = _is_event_stream(headers, url) or not _is_binary_response(headers)
+        self.buffer = bytearray()
+        self.usage: NormalizedUsage | None = None
+        self.first_chunk_time: float | None = None
+        self.chunk_count = 0
+        # Client read methods call each other (iter_lines -> iter_text ->
+        # iter_bytes); only the outermost one records.
+        self.depth = 0
+        self.sent = False
+        self.settlement_task: Any = None
+
+    def chunk(self, data: Any) -> None:
+        if self.sent or not data:
+            return
+        self.chunk_count += 1
+        if self.first_chunk_time is None:
+            self.first_chunk_time = time.perf_counter()
+        if self.buffering:
+            try:
+                self.buffer += data.encode("utf-8") if isinstance(data, str) else data
+            except Exception:
+                pass
+
+    def line(self, data: Any) -> None:
+        # Line iterators strip the separator SSE parsing needs.
+        if isinstance(data, str):
+            self.chunk(data + "\n")
+        elif isinstance(data, (bytes, bytearray)):
+            self.chunk(bytes(data) + b"\n")
+
+    def observe(self, usage: NormalizedUsage | None) -> None:
+        """Typed stream events (botocore) report usage directly."""
+        if self.sent:
+            return
+        self.chunk_count += 1
+        if self.first_chunk_time is None:
+            self.first_chunk_time = time.perf_counter()
+        if usage:
+            self.usage = merge_usage(self.usage, usage)
+
+    def done(self) -> None:
+        if self.sent:
+            return
+        self.sent = True
+        try:
+            self._emit()
+        except Exception:
+            logger.debug("[costkey] stream capture failed", exc_info=True)
+
+    async def finish_async(self) -> None:
+        self.done()
+        if self.settlement_task is not None:
+            await self.settlement_task
+
+    def _emit(self) -> None:
+        end = time.perf_counter()
+        duration_ms = (end - self.start) * 1000
+        usage, model, provider_request_id, body = self.usage, None, None, None
+        if self.buffer:
+            streamed, model, provider_request_id, body = _stream_summary(
+                bytes(self.buffer), self.extractor, self.url, self.request_body, self.headers,
+            )
+            if streamed:
+                usage = merge_usage(usage, streamed)
+        called = call_usage(self.extractor, self.url, self.request_body, body,
+                            self.headers, self.status_code)
+        if called:
+            usage = merge_usage(usage, called)
+
+        ttft = ((self.first_chunk_time - self.start) * 1000) if self.first_chunk_time else None
+        tps = None
+        if usage and usage.output_tokens and self.first_chunk_time:
+            stream_secs = end - self.first_chunk_time
+            if stream_secs > 0:
+                tps = usage.output_tokens / stream_secs
+        stream_timing = StreamTiming(
+            ttft=round(ttft, 2) if ttft else None,
+            tps=round(tps, 2) if tps else None,
+            stream_duration=round(duration_ms, 2),
+            chunk_count=self.chunk_count,
+        )
+
+        _process(self.extractor, self.url, self.method, self.status_code,
+                 self.request_body, body, duration_ms,
+                 True, stream_timing, self.call_site, self.ctx, event_id=self.event_id,
+                 provider_request_id=provider_request_id,
+                 capture_body=self.capture_body, usage=usage, model=model,
+                 response_headers=self.headers)
+        event_id = self.event_id or uuid.uuid4().hex
+        if _reservation_id(self.admission_decision) is None:
+            return
+        if self.settlement_async:
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                loop = None
+            if loop is not None:
+                self.settlement_task = loop.create_task(_settle_async(
+                    self.admission_decision, usage, self.status_code, event_id,
+                ))
+                return
+        _settle_sync(self.admission_decision, usage, self.status_code, event_id)
+
+
+def _record_iter(recorder: _StreamRecorder, original: Any, record: Callable[[Any], None]) -> Any:
+    @functools.wraps(original)
+    def wrapped(*a: Any, **kw: Any) -> Iterator[Any]:
+        recorder.depth += 1
+        outer = recorder.depth == 1
+        try:
+            for item in original(*a, **kw):
+                if outer:
+                    record(item)
+                yield item
+        finally:
+            recorder.depth -= 1
+            if outer:
+                recorder.done()
+    return wrapped
+
+
+def _record_aiter(recorder: _StreamRecorder, original: Any, record: Callable[[Any], None]) -> Any:
+    @functools.wraps(original)
+    async def wrapped(*a: Any, **kw: Any) -> AsyncIterator[Any]:
+        recorder.depth += 1
+        outer = recorder.depth == 1
+        try:
+            async for item in original(*a, **kw):
+                if outer:
+                    record(item)
+                yield item
+        finally:
+            recorder.depth -= 1
+            if outer:
+                await recorder.finish_async()
+    return wrapped
+
+
+def _emit_when_collected(owner: Any, recorder: _StreamRecorder) -> None:
+    """A stream the caller drops without finishing or closing still reports."""
+    try:
+        weakref.finalize(owner, recorder.done).atexit = False
+    except TypeError:
+        pass
+
+
 # ── httpx patching ──
 
 def _patch_httpx() -> None:
@@ -1094,30 +1530,18 @@ def _patch_httpx() -> None:
             capture_body = _state.capture_body
             start = time.perf_counter()
 
-            request_body = None
-            if request.content:
-                try:
-                    request_body = json.loads(request.content)
-                except Exception:
-                    pass
-
-            is_streaming = _is_streaming_request(request_body, url) or kwargs.get("stream", False)
+            raw_body = _httpx_request_bytes(request)
+            request_body = _decode_request_body(
+                raw_body if raw_body is not None else getattr(request, "stream", None),
+                request.headers.get("content-type"),
+            )
+            stream_requested = bool(kwargs.get("stream", False))
+            is_streaming = _is_streaming_request(request_body, url) or stream_requested
 
             event_id = uuid.uuid4().hex
-            request_model = extractor.extract_model(request_body, None)
-            admission_decision = _run_admission_sync({
-                "id": event_id,
-                "admissionId": event_id,
-                "requestId": event_id,
-                "projectId": _state.project_id,
-                "provider": _provider_value(extractor.provider),
-                "model": request_model,
-                "context": _safe_admission_context(ctx),
-                # Admission deliberately receives metadata only; request
-                # bodies and credentials never leave the application here.
-                "usageBounds": _estimate_request_usage(request_body, request.content),
-                "streaming": is_streaming,
-            })
+            admission_decision = _run_admission_sync(_admission_payload(
+                event_id, extractor, url, request_body, raw_body, ctx, is_streaming,
+            ))
 
             try:
                 response = _state._original_httpx_send(self, request_to_send, **kwargs)
@@ -1125,7 +1549,7 @@ def _patch_httpx() -> None:
                 _settle_sync(admission_decision, None, None, event_id)
                 raise
 
-            if is_streaming:
+            if stream_requested:
                 # Wrap the response's iteration methods to capture streaming data
                 _wrap_streaming_response(
                     response, extractor, url, request.method,
@@ -1134,19 +1558,32 @@ def _patch_httpx() -> None:
                     admission_decision=admission_decision,
                     capture_body=capture_body,
                 )
+            elif is_streaming or _is_stream_response(response.headers):
+                # send() already read the whole stream; nothing will iterate it.
+                recorder = _StreamRecorder(
+                    extractor, url, request.method, request_body, start, call_site, ctx,
+                    status_code=response.status_code, headers=response.headers,
+                    event_id=event_id, admission_decision=admission_decision,
+                    capture_body=capture_body,
+                )
+                recorder.chunk(response.content)
+                recorder.done()
             else:
                 # Non-streaming — read body normally
                 duration_ms = (time.perf_counter() - start) * 1000
                 response_body = None
-                try:
-                    response_body = response.json()
-                except Exception:
-                    pass
-                usage = extractor.extract_usage(response_body) if response_body else None
+                if not _is_binary_response(response.headers):
+                    try:
+                        response_body = response.json()
+                    except Exception:
+                        pass
+                usage = call_usage(extractor, url, request_body, response_body,
+                                   response.headers, response.status_code)
                 _process(extractor, url, request.method, response.status_code,
                          request_body, response_body, duration_ms,
                          False, None, call_site, ctx, event_id=event_id,
-                         capture_body=capture_body)
+                         capture_body=capture_body, usage=usage,
+                         response_headers=response.headers)
                 _settle_sync(admission_decision, usage, response.status_code, event_id)
 
             return response
@@ -1171,28 +1608,18 @@ def _patch_httpx() -> None:
             capture_body = _state.capture_body
             start = time.perf_counter()
 
-            request_body = None
-            if request.content:
-                try:
-                    request_body = json.loads(request.content)
-                except Exception:
-                    pass
-
-            is_streaming = _is_streaming_request(request_body, url) or kwargs.get("stream", False)
+            raw_body = _httpx_request_bytes(request)
+            request_body = _decode_request_body(
+                raw_body if raw_body is not None else getattr(request, "stream", None),
+                request.headers.get("content-type"),
+            )
+            stream_requested = bool(kwargs.get("stream", False))
+            is_streaming = _is_streaming_request(request_body, url) or stream_requested
 
             event_id = uuid.uuid4().hex
-            request_model = extractor.extract_model(request_body, None)
-            admission_decision = await _run_admission_async({
-                "id": event_id,
-                "admissionId": event_id,
-                "requestId": event_id,
-                "projectId": _state.project_id,
-                "provider": _provider_value(extractor.provider),
-                "model": request_model,
-                "context": _safe_admission_context(ctx),
-                "usageBounds": _estimate_request_usage(request_body, request.content),
-                "streaming": is_streaming,
-            })
+            admission_decision = await _run_admission_async(_admission_payload(
+                event_id, extractor, url, request_body, raw_body, ctx, is_streaming,
+            ))
 
             try:
                 response = await _state._original_httpx_async_send(self, request_to_send, **kwargs)
@@ -1200,7 +1627,7 @@ def _patch_httpx() -> None:
                 await _settle_async(admission_decision, None, None, event_id)
                 raise
 
-            if is_streaming:
+            if stream_requested:
                 _wrap_streaming_response(
                     response, extractor, url, request.method,
                     request_body, start, call_site, ctx,
@@ -1209,18 +1636,30 @@ def _patch_httpx() -> None:
                     settlement_async=True,
                     capture_body=capture_body,
                 )
+            elif is_streaming or _is_stream_response(response.headers):
+                recorder = _StreamRecorder(
+                    extractor, url, request.method, request_body, start, call_site, ctx,
+                    status_code=response.status_code, headers=response.headers,
+                    event_id=event_id, admission_decision=admission_decision,
+                    settlement_async=True, capture_body=capture_body,
+                )
+                recorder.chunk(response.content)
+                await recorder.finish_async()
             else:
                 duration_ms = (time.perf_counter() - start) * 1000
                 response_body = None
-                try:
-                    response_body = response.json()
-                except Exception:
-                    pass
-                usage = extractor.extract_usage(response_body) if response_body else None
+                if not _is_binary_response(response.headers):
+                    try:
+                        response_body = response.json()
+                    except Exception:
+                        pass
+                usage = call_usage(extractor, url, request_body, response_body,
+                                   response.headers, response.status_code)
                 _process(extractor, url, request.method, response.status_code,
                          request_body, response_body, duration_ms,
                          False, None, call_site, ctx, event_id=event_id,
-                         capture_body=capture_body)
+                         capture_body=capture_body, usage=usage,
+                         response_headers=response.headers)
                 await _settle_async(admission_decision, usage, response.status_code, event_id)
 
             return response
@@ -1239,190 +1678,101 @@ def _wrap_streaming_response(
     admission_decision: dict[str, Any] | None = None,
     settlement_async: bool = False,
     capture_body: bool | None = None,
-) -> None:
+) -> _StreamRecorder:
     """
     Wrap httpx Response iteration methods to capture streaming data.
 
     The Anthropic/OpenAI SDKs use response.iter_lines() or response.iter_bytes()
-    to consume SSE streams. We wrap these methods to accumulate the text,
+    to consume SSE streams. We wrap these methods to accumulate the bytes,
     then extract usage + timing when iteration finishes.
     """
-    accumulated_text = ""
-    first_chunk_time: float | None = None
-    chunk_count = 0
-    event_sent = False
-    settlement_task: Any = None
+    recorder = _StreamRecorder(
+        extractor, url, method, request_body, start, call_site, ctx,
+        status_code=getattr(response, "status_code", None),
+        headers=getattr(response, "headers", None),
+        event_id=event_id, admission_decision=admission_decision,
+        settlement_async=settlement_async, capture_body=capture_body,
+    )
 
-    def _on_chunk(chunk_bytes: bytes) -> None:
-        nonlocal accumulated_text, first_chunk_time, chunk_count
-        chunk_count += 1
-        if first_chunk_time is None:
-            first_chunk_time = time.perf_counter()
-        try:
-            accumulated_text += chunk_bytes.decode("utf-8", errors="replace")
-        except Exception:
-            pass
+    for name, record in (
+        ("iter_bytes", recorder.chunk), ("iter_lines", recorder.line),
+        ("iter_text", recorder.chunk), ("iter_raw", recorder.chunk),
+    ):
+        original = getattr(response, name, None)
+        if original is not None:
+            setattr(response, name, _record_iter(recorder, original, record))
 
-    def _on_done() -> None:
-        nonlocal event_sent, settlement_task
-        if event_sent:
-            return
-        event_sent = True
-
-        end = time.perf_counter()
-        duration_ms = (end - start) * 1000
-
-        usage = _extract_sse_usage(accumulated_text, extractor)
-        model = _extract_sse_model(accumulated_text, request_body, extractor)
-
-        ttft = ((first_chunk_time - start) * 1000) if first_chunk_time else None
-        tps = None
-        if usage and usage.output_tokens and first_chunk_time:
-            stream_secs = end - first_chunk_time
-            if stream_secs > 0:
-                tps = usage.output_tokens / stream_secs
-
-        stream_timing = StreamTiming(
-            ttft=round(ttft, 2) if ttft else None,
-            tps=round(tps, 2) if tps else None,
-            stream_duration=round(duration_ms, 2),
-            chunk_count=chunk_count,
-        )
-
-        _process(extractor, url, method, response.status_code,
-                 request_body, None, duration_ms,
-                 True, stream_timing, call_site, ctx, event_id=event_id,
-                 provider_request_id=_extract_sse_provider_request_id(accumulated_text),
-                 capture_body=capture_body)
-        if settlement_async:
-            try:
-                import asyncio
-                settlement_task = asyncio.create_task(_settle_async(
-                    admission_decision, usage, response.status_code, event_id or uuid.uuid4().hex,
-                ))
-            except RuntimeError:
-                _settle_sync(admission_decision, usage, response.status_code, event_id or uuid.uuid4().hex)
-        else:
-            _settle_sync(admission_decision, usage, response.status_code, event_id or uuid.uuid4().hex)
-
-    async def _finish_async() -> None:
-        _on_done()
-        if settlement_task is not None:
-            await settlement_task
-
-    # Wrap iter_bytes
-    original_iter_bytes = response.iter_bytes
-
-    @functools.wraps(original_iter_bytes)
-    def wrapped_iter_bytes(*a: Any, **kw: Any) -> Iterator[bytes]:
-        try:
-            for chunk in original_iter_bytes(*a, **kw):
-                _on_chunk(chunk)
-                yield chunk
-        finally:
-            _on_done()
-
-    response.iter_bytes = wrapped_iter_bytes
-
-    # Wrap iter_lines
-    original_iter_lines = response.iter_lines
-
-    @functools.wraps(original_iter_lines)
-    def wrapped_iter_lines(*a: Any, **kw: Any) -> Iterator[str]:
-        try:
-            for line in original_iter_lines(*a, **kw):
-                _on_chunk(line.encode("utf-8") if isinstance(line, str) else line)
-                yield line
-        finally:
-            _on_done()
-
-    response.iter_lines = wrapped_iter_lines
-
-    # Wrap iter_text
-    if hasattr(response, "iter_text"):
-        original_iter_text = response.iter_text
-
-        @functools.wraps(original_iter_text)
-        def wrapped_iter_text(*a: Any, **kw: Any) -> Iterator[str]:
-            try:
-                for text in original_iter_text(*a, **kw):
-                    _on_chunk(text.encode("utf-8") if isinstance(text, str) else text)
-                    yield text
-            finally:
-                _on_done()
-
-        response.iter_text = wrapped_iter_text
-
-    # Wrap iter_raw
-    if hasattr(response, "iter_raw"):
-        original_iter_raw = response.iter_raw
-
-        @functools.wraps(original_iter_raw)
-        def wrapped_iter_raw(*a: Any, **kw: Any) -> Iterator[bytes]:
-            try:
-                for chunk in original_iter_raw(*a, **kw):
-                    _on_chunk(chunk)
-                    yield chunk
-            finally:
-                _on_done()
-
-        response.iter_raw = wrapped_iter_raw
+    for name, record in (
+        ("aiter_bytes", recorder.chunk), ("aiter_lines", recorder.line),
+        ("aiter_text", recorder.chunk), ("aiter_raw", recorder.chunk),
+    ):
+        original = getattr(response, name, None)
+        if original is not None:
+            setattr(response, name, _record_aiter(recorder, original, record))
 
     # Wrap read() for cases where the body is read all at once
-    original_read = response.read
-
-    @functools.wraps(original_read)
-    def wrapped_read(*a: Any, **kw: Any) -> bytes:
-        data = original_read(*a, **kw)
-        _on_chunk(data)
-        _on_done()
-        return data
-
-    response.read = wrapped_read
-
-    # Wrap async variants if they exist
-    if hasattr(response, "aiter_bytes"):
-        original_aiter_bytes = response.aiter_bytes
-
-        @functools.wraps(original_aiter_bytes)
-        async def wrapped_aiter_bytes(*a: Any, **kw: Any) -> AsyncIterator[bytes]:
+    original_read = getattr(response, "read", None)
+    if original_read is not None:
+        @functools.wraps(original_read)
+        def wrapped_read(*a: Any, **kw: Any) -> bytes:
+            recorder.depth += 1
             try:
-                async for chunk in original_aiter_bytes(*a, **kw):
-                    _on_chunk(chunk)
-                    yield chunk
+                data = original_read(*a, **kw)
             finally:
-                await _finish_async()
+                recorder.depth -= 1
+            if recorder.depth == 0:
+                recorder.chunk(data)
+                recorder.done()
+            return data
 
-        response.aiter_bytes = wrapped_aiter_bytes
+        response.read = wrapped_read
 
-    if hasattr(response, "aiter_lines"):
-        original_aiter_lines = response.aiter_lines
-
-        @functools.wraps(original_aiter_lines)
-        async def wrapped_aiter_lines(*a: Any, **kw: Any) -> AsyncIterator[str]:
-            try:
-                async for line in original_aiter_lines(*a, **kw):
-                    _on_chunk(line.encode("utf-8") if isinstance(line, str) else line)
-                    yield line
-            finally:
-                await _finish_async()
-
-        response.aiter_lines = wrapped_aiter_lines
-
-    if hasattr(response, "aread"):
-        original_aread = response.aread
-
+    original_aread = getattr(response, "aread", None)
+    if original_aread is not None:
         @functools.wraps(original_aread)
         async def wrapped_aread(*a: Any, **kw: Any) -> bytes:
-            data = await original_aread(*a, **kw)
-            _on_chunk(data)
-            await _finish_async()
+            recorder.depth += 1
+            try:
+                data = await original_aread(*a, **kw)
+            finally:
+                recorder.depth -= 1
+            if recorder.depth == 0:
+                recorder.chunk(data)
+                await recorder.finish_async()
             return data
 
         response.aread = wrapped_aread
 
+    # A stream closed without being iterated still reports. httpx closes the
+    # response itself at the end of iteration, before decoders flush, so an
+    # in-progress iteration reports from its own finally instead.
+    original_close = getattr(response, "close", None)
+    if original_close is not None:
+        @functools.wraps(original_close)
+        def wrapped_close(*a: Any, **kw: Any) -> Any:
+            try:
+                return original_close(*a, **kw)
+            finally:
+                if recorder.depth == 0:
+                    recorder.done()
 
-# ── requests patching ──
+        response.close = wrapped_close
+
+    original_aclose = getattr(response, "aclose", None)
+    if original_aclose is not None:
+        @functools.wraps(original_aclose)
+        async def wrapped_aclose(*a: Any, **kw: Any) -> Any:
+            try:
+                return await original_aclose(*a, **kw)
+            finally:
+                if recorder.depth == 0:
+                    await recorder.finish_async()
+
+        response.aclose = wrapped_aclose
+
+    _emit_when_collected(response, recorder)
+    return recorder
+
 
 def _unpatch_httpx() -> None:
     try:
@@ -1434,6 +1784,8 @@ def _unpatch_httpx() -> None:
     except ImportError:
         pass
 
+
+# ── requests patching ──
 
 def _patch_requests() -> None:
     try:
@@ -1456,49 +1808,51 @@ def _patch_requests() -> None:
             capture_body = _state.capture_body
             start = time.perf_counter()
 
-            request_body = None
-            if request.body:
-                try:
-                    request_body = json.loads(request.body)
-                except Exception:
-                    pass
-
-            is_streaming = _is_streaming_request(request_body, url) or bool(kwargs.get("stream", False))
+            request_body = _decode_request_body(request.body, request.headers.get("content-type"))
+            stream_requested = bool(kwargs.get("stream", False))
+            is_streaming = _is_streaming_request(request_body, url) or stream_requested
             event_id = uuid.uuid4().hex
-            request_model = extractor.extract_model(request_body, None)
-            admission_decision = _run_admission_sync({
-                "id": event_id,
-                "admissionId": event_id,
-                "requestId": event_id,
-                "projectId": _state.project_id,
-                "provider": _provider_value(extractor.provider),
-                "model": request_model,
-                "context": _safe_admission_context(ctx),
-                "usageBounds": _estimate_request_usage(request_body, request.body),
-                "streaming": is_streaming,
-            })
+            admission_decision = _run_admission_sync(_admission_payload(
+                event_id, extractor, url, request_body, request.body, ctx, is_streaming,
+            ))
 
             try:
                 response = _state._original_requests_send(self, request_to_send, **kwargs)
             except Exception:
                 _settle_sync(admission_decision, None, None, event_id)
                 raise
-            duration_ms = (time.perf_counter() - start) * 1000
 
-            # Reading a streamed requests response here would buffer the whole
-            # stream before the caller sees it; record the call without usage.
+            if stream_requested or is_streaming or _is_stream_response(response.headers):
+                recorder = _StreamRecorder(
+                    extractor, url, request.method, request_body, start, call_site, ctx,
+                    status_code=response.status_code, headers=response.headers,
+                    event_id=event_id, admission_decision=admission_decision,
+                    capture_body=capture_body,
+                )
+                if stream_requested:
+                    # Reading here would buffer the stream before the caller
+                    # sees it; record what the caller reads instead.
+                    _wrap_requests_stream(response, recorder)
+                else:
+                    recorder.chunk(response.content)
+                    recorder.done()
+                return response
+
+            duration_ms = (time.perf_counter() - start) * 1000
             response_body = None
-            if not is_streaming:
+            if not _is_binary_response(response.headers):
                 try:
                     response_body = response.json()
                 except Exception:
                     response_body = None
-            usage = extractor.extract_usage(response_body) if response_body else None
+            usage = call_usage(extractor, url, request_body, response_body,
+                               response.headers, response.status_code)
 
             _process(extractor, url, request.method, response.status_code,
                      request_body, response_body, duration_ms,
                      False, None, call_site, ctx, event_id=event_id,
-                     capture_body=capture_body)
+                     capture_body=capture_body, usage=usage,
+                     response_headers=response.headers)
             _settle_sync(admission_decision, usage, response.status_code, event_id)
 
             return response
@@ -1510,6 +1864,22 @@ def _patch_requests() -> None:
             logger.debug("[costkey] requests not installed, skipping patch")
 
 
+def _wrap_requests_stream(response: Any, recorder: _StreamRecorder) -> None:
+    # iter_lines(), .content, .text and .json() all read through iter_content.
+    response.iter_content = _record_iter(recorder, response.iter_content, recorder.chunk)
+    original_close = response.close
+
+    @functools.wraps(original_close)
+    def wrapped_close(*a: Any, **kw: Any) -> Any:
+        try:
+            return original_close(*a, **kw)
+        finally:
+            recorder.done()
+
+    response.close = wrapped_close
+    _emit_when_collected(response, recorder)
+
+
 def _unpatch_requests() -> None:
     try:
         import requests
@@ -1519,14 +1889,444 @@ def _unpatch_requests() -> None:
         pass
 
 
+# ── aiohttp patching ──
+
+class _ReplayProtocol:
+    """Flow control for a reader that only replays an already-read body."""
+    _reading_paused = True
+    connected = False
+
+    def pause_reading(self, *_a: Any, **_kw: Any) -> None:
+        pass
+
+    def resume_reading(self, *_a: Any, **_kw: Any) -> None:
+        pass
+
+
+def _replay_content(response: Any, body: bytes) -> None:
+    """Give a pre-read response a fresh ``content`` stream holding its body,
+    so callers that read ``response.content`` directly still see it."""
+    try:
+        from aiohttp import StreamReader
+        reader = StreamReader(_ReplayProtocol(), 2 ** 16, loop=asyncio.get_running_loop())
+        if body:
+            reader.feed_data(body)
+        reader.feed_eof()
+        response.content = reader
+    except Exception:
+        logger.debug("[costkey] aiohttp body replay unavailable", exc_info=True)
+
+
+class _TeeStreamReader:
+    """Forwards an aiohttp StreamReader, recording what the caller reads."""
+
+    def __init__(self, reader: Any, recorder: _StreamRecorder) -> None:
+        self._reader = reader
+        self._recorder = recorder
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._reader, name)
+
+    def _seen(self, data: Any) -> Any:
+        try:
+            self._recorder.chunk(data)
+            if self._reader.at_eof():
+                self._recorder.done()
+        except Exception:
+            logger.debug("[costkey] aiohttp stream capture failed", exc_info=True)
+        return data
+
+    async def read(self, n: int = -1) -> bytes:
+        return self._seen(await self._reader.read(n))
+
+    async def readline(self, *a: Any, **kw: Any) -> bytes:
+        return self._seen(await self._reader.readline(*a, **kw))
+
+    async def readuntil(self, *a: Any, **kw: Any) -> bytes:
+        return self._seen(await self._reader.readuntil(*a, **kw))
+
+    async def readany(self) -> bytes:
+        return self._seen(await self._reader.readany())
+
+    async def readexactly(self, n: int) -> bytes:
+        return self._seen(await self._reader.readexactly(n))
+
+    async def readchunk(self) -> tuple[bytes, bool]:
+        data, end_of_chunk = await self._reader.readchunk()
+        self._seen(data)
+        return data, end_of_chunk
+
+    def read_nowait(self, n: int = -1) -> bytes:
+        return self._seen(self._reader.read_nowait(n))
+
+    def __aiter__(self) -> Any:
+        from aiohttp.streams import AsyncStreamIterator
+        return AsyncStreamIterator(self.readline)
+
+    def iter_chunked(self, n: int) -> Any:
+        from aiohttp.streams import AsyncStreamIterator
+        return AsyncStreamIterator(lambda: self.read(n))
+
+    def iter_any(self) -> Any:
+        from aiohttp.streams import AsyncStreamIterator
+        return AsyncStreamIterator(self.readany)
+
+    def iter_chunks(self) -> Any:
+        from aiohttp.streams import ChunkTupleAsyncStreamIterator
+        return ChunkTupleAsyncStreamIterator(self)
+
+
+def _record_aiohttp_stream(response: Any, recorder: _StreamRecorder) -> None:
+    response.content = _TeeStreamReader(response.content, recorder)
+    # A caller that stops early releases or closes the response.
+    for name in ("release", "close"):
+        original = getattr(response, name)
+
+        def wrapped(*a: Any, _original: Any = original, **kw: Any) -> Any:
+            try:
+                return _original(*a, **kw)
+            finally:
+                recorder.done()
+
+        setattr(response, name, wrapped)
+    _emit_when_collected(response, recorder)
+
+
+def _params_request_sse(params: Any) -> bool:
+    try:
+        if isinstance(params, str):
+            return "alt=sse" in params
+        items = params.items() if hasattr(params, "items") else params or ()
+        return any(str(key) == "alt" and str(value) == "sse" for key, value in items)
+    except Exception:
+        return False
+
+
+def _patch_aiohttp() -> None:
+    try:
+        import aiohttp
+        original = aiohttp.ClientSession._request
+    except Exception:
+        if _state.debug:
+            logger.debug("[costkey] aiohttp not available, skipping patch")
+        return
+    if _state._original_aiohttp_request is not None:
+        return
+    _state._original_aiohttp_request = original
+
+    async def patched_request(self: Any, method: str, str_or_url: Any, **kwargs: Any) -> Any:
+        try:
+            call = _aiohttp_call(self, method, str_or_url, kwargs)
+        except Exception:
+            logger.debug("[costkey] aiohttp request inspection failed", exc_info=True)
+            call = None
+        if call is None:
+            return await original(self, method, str_or_url, **kwargs)
+
+        admission_decision = await _run_admission_async(call["admission"])
+        try:
+            response = await original(self, method, str_or_url, **call["kwargs"])
+        except Exception:
+            await _settle_async(admission_decision, None, None, call["event_id"])
+            raise
+        try:
+            await _observe_aiohttp_response(response, call, admission_decision)
+        except Exception:
+            logger.debug("[costkey] aiohttp response capture failed", exc_info=True)
+        return response
+
+    aiohttp.ClientSession._request = patched_request
+
+
+def _aiohttp_call(session: Any, method: str, str_or_url: Any, kwargs: dict[str, Any]) -> dict[str, Any] | None:
+    try:
+        url = str(session._build_url(str_or_url))
+    except Exception:
+        url = str(str_or_url)
+    extractor = find_extractor(url)
+    if not extractor or url.startswith(("ws://", "wss://")):
+        return None
+    headers = _lower_headers(kwargs.get("headers"))
+    if headers is not None and str(headers.get("upgrade") or "").lower() == "websocket":
+        return None
+
+    call_site = capture_call_site()
+    ctx = {**_state.default_context, **get_context()}
+    for key, value in _incoming_context(headers).items():
+        ctx.setdefault(key, value)
+    send_kwargs = kwargs
+    stripped = _without_carrier_headers(kwargs.get("headers"))
+    if stripped is not kwargs.get("headers"):
+        send_kwargs = {**kwargs, "headers": stripped}
+
+    raw_body = kwargs.get("data")
+    request_body = kwargs.get("json")
+    if request_body is None:
+        request_body = _decode_request_body(
+            raw_body, headers.get("content-type") if headers is not None else None,
+        )
+    streaming = _is_streaming_request(request_body, url) or _params_request_sse(kwargs.get("params"))
+    event_id = uuid.uuid4().hex
+    return {
+        "extractor": extractor,
+        "url": url,
+        "method": str(method).upper(),
+        "request_body": request_body,
+        "streaming": streaming,
+        "call_site": call_site,
+        "ctx": ctx,
+        "capture_body": _state.capture_body,
+        "event_id": event_id,
+        "kwargs": send_kwargs,
+        "admission": _admission_payload(
+            event_id, extractor, url, request_body,
+            raw_body if isinstance(raw_body, (bytes, bytearray, str)) else None, ctx, streaming,
+        ),
+        "start": time.perf_counter(),
+    }
+
+
+async def _observe_aiohttp_response(response: Any, call: dict[str, Any],
+                                    admission_decision: dict[str, Any] | None) -> None:
+    status = getattr(response, "status", None)
+    headers = getattr(response, "headers", None)
+    if status == 101:
+        return
+    if call["streaming"] or _is_stream_response(headers):
+        recorder = _StreamRecorder(
+            call["extractor"], call["url"], call["method"], call["request_body"],
+            call["start"], call["call_site"], call["ctx"],
+            status_code=status, headers=headers, event_id=call["event_id"],
+            admission_decision=admission_decision, settlement_async=True,
+            capture_body=call["capture_body"],
+        )
+        _record_aiohttp_stream(response, recorder)
+        return
+
+    response_body = None
+    if not _is_binary_response(headers):
+        try:
+            # aiohttp caches the body for read()/text()/json(); direct
+            # ``content`` readers get a replay of it.
+            body = await response.read()
+        except Exception:
+            logger.debug("[costkey] aiohttp body read failed", exc_info=True)
+            body = None
+        if body is not None:
+            _replay_content(response, body)
+            try:
+                response_body = json.loads(body)
+            except Exception:
+                response_body = None
+    duration_ms = (time.perf_counter() - call["start"]) * 1000
+    usage = call_usage(call["extractor"], call["url"], call["request_body"], response_body, headers, status)
+    _process(call["extractor"], call["url"], call["method"], status,
+             call["request_body"], response_body, duration_ms,
+             False, None, call["call_site"], call["ctx"], event_id=call["event_id"],
+             capture_body=call["capture_body"], usage=usage, response_headers=headers)
+    await _settle_async(admission_decision, usage, status, call["event_id"])
+
+
+def _unpatch_aiohttp() -> None:
+    if _state._original_aiohttp_request is None:
+        return
+    try:
+        import aiohttp
+        aiohttp.ClientSession._request = _state._original_aiohttp_request
+    except Exception:
+        pass
+    _state._original_aiohttp_request = None
+
+
+# ── botocore (boto3) Bedrock patching ──
+
+_BEDROCK_OPERATIONS = {
+    "Converse": "converse",
+    "ConverseStream": "converse-stream",
+    "InvokeModel": "invoke",
+    "InvokeModelWithResponseStream": "invoke-with-response-stream",
+}
+_BEDROCK = BedrockExtractor()
+
+
+class _BedrockEventStream:
+    """Iterates a botocore EventStream, recording usage events for one call."""
+
+    def __init__(self, stream: Any, recorder: _StreamRecorder) -> None:
+        self._stream = stream
+        self._recorder = recorder
+        _emit_when_collected(self, recorder)
+
+    def __iter__(self) -> Iterator[Any]:
+        try:
+            for event in self._stream:
+                try:
+                    self._recorder.observe(_bedrock_payload_usage(event, _BEDROCK))
+                except Exception:
+                    logger.debug("[costkey] bedrock stream capture failed", exc_info=True)
+                yield event
+        finally:
+            self._recorder.done()
+
+    def close(self) -> Any:
+        try:
+            return self._stream.close()
+        finally:
+            self._recorder.done()
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._stream, name)
+
+
+def _bedrock_request_body(operation_name: str, api_params: Any) -> Any:
+    if not isinstance(api_params, dict):
+        return None
+    if operation_name.startswith("InvokeModel"):
+        body = api_params.get("body")
+        if isinstance(body, (bytes, bytearray, str)):
+            try:
+                return _json_safe(json.loads(body))
+            except Exception:
+                return None
+        return None
+    return _json_safe(api_params)
+
+
+def _bedrock_response_meta(response: Any) -> tuple[int | None, Any, str | None]:
+    meta = response.get("ResponseMetadata") if isinstance(response, dict) else None
+    if not isinstance(meta, dict):
+        return None, None, None
+    status = meta.get("HTTPStatusCode")
+    request_id = meta.get("RequestId")
+    return (
+        status if isinstance(status, int) else None,
+        meta.get("HTTPHeaders"),
+        request_id if isinstance(request_id, str) and request_id else None,
+    )
+
+
+def _patch_botocore() -> None:
+    try:
+        from botocore.client import BaseClient
+        original = BaseClient._make_api_call
+    except Exception:
+        if _state.debug:
+            logger.debug("[costkey] botocore not available, skipping patch")
+        return
+    if _state._original_botocore_call is not None:
+        return
+    _state._original_botocore_call = original
+
+    def patched_make_api_call(self: Any, operation_name: str, api_params: Any) -> Any:
+        path = _BEDROCK_OPERATIONS.get(operation_name)
+        try:
+            bedrock = path is not None and self.meta.service_model.service_name == "bedrock-runtime"
+        except Exception:
+            bedrock = False
+        if not bedrock:
+            return original(self, operation_name, api_params)
+        return _bedrock_api_call(original, self, operation_name, path, api_params)
+
+    BaseClient._make_api_call = patched_make_api_call
+
+
+def _bedrock_api_call(original: Any, client: Any, operation_name: str, path: str, api_params: Any) -> Any:
+    try:
+        model_id = api_params.get("modelId") if isinstance(api_params, dict) else None
+        endpoint = str(getattr(client.meta, "endpoint_url", "") or "https://bedrock-runtime.amazonaws.com")
+        url = f"{endpoint.rstrip('/')}/model/{quote(str(model_id or ''), safe='')}/{path}"
+        request_body = _bedrock_request_body(operation_name, api_params)
+        call_site = capture_call_site()
+        ctx = {**_state.default_context, **get_context()}
+        capture_body = _state.capture_body
+        streaming = operation_name.endswith("Stream")
+        event_id = uuid.uuid4().hex
+        payload = _admission_payload(event_id, _BEDROCK, url, request_body,
+                                     None, ctx, streaming)
+        payload["model"] = model_id
+        start = time.perf_counter()
+    except Exception:
+        logger.debug("[costkey] bedrock request inspection failed", exc_info=True)
+        return original(client, operation_name, api_params)
+
+    admission_decision = _run_admission_sync(payload)
+    try:
+        response = original(client, operation_name, api_params)
+    except Exception as exc:
+        status, headers, request_id = _bedrock_response_meta(getattr(exc, "response", None))
+        if status is not None:
+            _process(_BEDROCK, url, "POST", status, request_body, None,
+                     (time.perf_counter() - start) * 1000, streaming, None, call_site, ctx,
+                     event_id=event_id, provider_request_id=request_id,
+                     capture_body=capture_body, usage=None, model=model_id,
+                     response_headers=headers)
+        _settle_sync(admission_decision, None, status, event_id)
+        raise
+
+    try:
+        status, headers, request_id = _bedrock_response_meta(response)
+        if streaming:
+            key = "stream" if operation_name == "ConverseStream" else "body"
+            recorder = _StreamRecorder(
+                _BEDROCK, url, "POST", request_body, start, call_site, ctx,
+                status_code=status, headers=headers, event_id=event_id,
+                admission_decision=admission_decision, capture_body=capture_body,
+            )
+            if response.get(key) is not None:
+                response[key] = _BedrockEventStream(response[key], recorder)
+            else:
+                recorder.done()
+            return response
+
+        response_body: Any = None
+        if operation_name == "InvokeModel":
+            raw = response.get("body")
+            if raw is not None and hasattr(raw, "read"):
+                data = raw.read()
+                from botocore.response import StreamingBody
+                response["body"] = StreamingBody(io.BytesIO(data), len(data))
+                if "json" in str(response.get("contentType") or "application/json").lower():
+                    try:
+                        response_body = _json_safe(json.loads(data))
+                    except Exception:
+                        response_body = None
+        else:
+            response_body = _json_safe({k: v for k, v in response.items() if k != "ResponseMetadata"})
+        usage = call_usage(_BEDROCK, url, request_body, response_body, headers, status)
+        _process(_BEDROCK, url, "POST", status, request_body, response_body,
+                 (time.perf_counter() - start) * 1000, False, None, call_site, ctx,
+                 event_id=event_id, provider_request_id=request_id,
+                 capture_body=capture_body, usage=usage, model=model_id,
+                 response_headers=headers)
+        _settle_sync(admission_decision, usage, status, event_id)
+    except Exception:
+        logger.debug("[costkey] bedrock response capture failed", exc_info=True)
+    return response
+
+
+def _unpatch_botocore() -> None:
+    if _state._original_botocore_call is None:
+        return
+    try:
+        from botocore.client import BaseClient
+        BaseClient._make_api_call = _state._original_botocore_call
+    except Exception:
+        pass
+    _state._original_botocore_call = None
+
+
 # ── Event processing ──
+
+_UNSET: Any = object()
+
 
 def _process(extractor: Any, url: str, method: str, status_code: int | None,
              request_body: Any, response_body: Any,
              duration_ms: float, streaming: bool, stream_timing: StreamTiming | None,
              call_site: Any, ctx: dict[str, Any], event_id: str | None = None,
              provider_request_id: str | None = None,
-             capture_body: bool | None = None) -> None:
+             capture_body: bool | None = None, *, usage: Any = _UNSET,
+             model: str | None = None, response_headers: Any = None) -> None:
     try:
         # LiveKit/session adapters can report a cumulative LLM component at a
         # different granularity than the underlying HTTP request. Callers may
@@ -1534,8 +2334,9 @@ def _process(extractor: Any, url: str, method: str, status_code: int | None,
         # explicit session usage as the source of charge.
         if ctx.get("costkeyCapture") in {"manual", "explicit", "disabled"}:
             return
-        usage = extractor.extract_usage(response_body) if response_body else None
-        model = extractor.extract_model(request_body, response_body)
+        if usage is _UNSET:
+            usage = call_usage(extractor, url, request_body, response_body, response_headers, status_code)
+        model = model or call_model(extractor, url, request_body, response_body)
 
         response_charge_id = provider_request_id
         if isinstance(response_body, dict):
@@ -1543,7 +2344,7 @@ def _process(extractor: Any, url: str, method: str, status_code: int | None,
                 if isinstance(response_body.get(key), str) and response_body[key]:
                     response_charge_id = response_body[key]
                     break
-        request_model = extractor.extract_model(request_body, None)
+        request_model = call_model(extractor, url, request_body, None)
 
         should_capture = _state.capture_body if capture_body is None else capture_body
         resolved_id = event_id or uuid.uuid4().hex
@@ -1568,13 +2369,13 @@ def _process(extractor: Any, url: str, method: str, status_code: int | None,
             call_site=call_site,
             context=_scrub(ctx),
             metadata=(
-                _scrub(_extract_metadata(request_body, response_body))
+                _json_safe(_scrub(_extract_metadata(request_body, response_body)))
                 if should_capture
                 else _extract_safe_metadata(request_body, response_body)
             ),
             system_prompt=_scrub(_extract_system_prompt(request_body)) if should_capture else None,
-            request_body=_scrub(request_body) if should_capture else None,
-            response_body=_scrub(response_body) if should_capture else None,
+            request_body=_json_safe(_scrub(request_body)) if should_capture else None,
+            response_body=_json_safe(_scrub(response_body)) if should_capture else None,
             event_type="call",
             source="auto",
             trace_id=ctx.get("traceId", ctx.get("trace_id")),
