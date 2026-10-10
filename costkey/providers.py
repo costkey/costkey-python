@@ -121,7 +121,12 @@ class OpenAIExtractor:
     provider = Provider.OPENAI
     def match(self, url: str) -> bool:
         host = urlparse(url).hostname or ""
-        return host == "api.openai.com" or host.endswith(".openai.azure.com")
+        return (
+            host == "api.openai.com"
+            or host.endswith(".openai.azure.com")
+            or host.endswith(".services.ai.azure.com")
+            or host.endswith(".cognitiveservices.azure.com")
+        )
     def extract_usage(self, body: Any) -> NormalizedUsage | None:
         usage = _extract_openai_usage(body)
         if usage and isinstance(body, dict):
@@ -158,11 +163,28 @@ class AnthropicExtractor:
         return _extract_model(req, resp)
 
 
+def _is_grounded(body: dict[str, Any]) -> bool:
+    candidates = body.get("candidates")
+    if not isinstance(candidates, list):
+        return False
+    for candidate in candidates:
+        metadata = candidate.get("groundingMetadata") if isinstance(candidate, dict) else None
+        if isinstance(metadata, dict) and any(
+            metadata.get(key) for key in ("webSearchQueries", "retrievalQueries", "searchEntryPoint", "groundingChunks")
+        ):
+            return True
+    return False
+
+
 class GoogleExtractor:
     provider = Provider.GOOGLE
     def match(self, url: str) -> bool:
         host = urlparse(url).hostname or ""
-        return host == "generativelanguage.googleapis.com" or host.endswith("-aiplatform.googleapis.com")
+        return (
+            host == "generativelanguage.googleapis.com"
+            or host == "aiplatform.googleapis.com"
+            or host.endswith("-aiplatform.googleapis.com")
+        )
     def extract_usage(self, body: Any) -> NormalizedUsage | None:
         if not isinstance(body, dict): return None
         meta = body.get("usageMetadata")
@@ -172,13 +194,17 @@ class GoogleExtractor:
         total_t = _as_int(meta.get("totalTokenCount"))
         if total_t is None and input_t is not None and output_t is not None:
             total_t = input_t + output_t
+        native = _native_units(meta, exclude={
+            "promptTokenCount", "candidatesTokenCount", "totalTokenCount",
+            "thoughtsTokenCount", "cachedContentTokenCount",
+        }) or {}
+        # Search/Maps grounding is billed per grounded request, not per token.
+        if _is_grounded(body):
+            native["groundingRequests"] = 1
         return NormalizedUsage(input_tokens=input_t, output_tokens=output_t, total_tokens=total_t,
             reasoning_tokens=_as_int(meta.get("thoughtsTokenCount")),
             cache_read_tokens=_as_int(meta.get("cachedContentTokenCount")),
-            native_units=_native_units(meta, exclude={
-                "promptTokenCount", "candidatesTokenCount", "totalTokenCount",
-                "thoughtsTokenCount", "cachedContentTokenCount",
-            }))
+            native_units=native or None)
     def extract_model(self, req: Any, resp: Any) -> str | None:
         if isinstance(resp, dict) and isinstance(resp.get("modelVersion"), str):
             return resp["modelVersion"]

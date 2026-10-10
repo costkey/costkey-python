@@ -20,6 +20,7 @@ from costkey.patch import (
     _context,
     get_context,
     emit_lifecycle,
+    emit_span,
     _dispatch_event,
     _scrub,
     start_runtime_config_fetch,
@@ -49,6 +50,9 @@ _CONTEXT_ALIASES = {
     "case_id": "caseId",
     "conversation_id": "conversationId",
     "customer_id": "customerId",
+    "voice_session_id": "voiceSessionId",
+    "span_id": "spanId",
+    "user_id": "userId",
 }
 
 # Only these fields may cross an explicitly supplied service/queue carrier.
@@ -59,6 +63,7 @@ _EXPORT_CONTEXT_KEYS = frozenset({
     "groupId",
     "phase", "datasetRevision", "caseId", "environment", "service",
     "release", "feature", "customer", "customerId", "function", "operation", "conversationId",
+    "voiceSessionId", "spanId", "agent", "tool", "userId",
 })
 
 
@@ -667,6 +672,196 @@ def start_execution(
                 )
     finally:
         _execution_scope_owned.reset(owned_token)
+
+
+_SPAN_KINDS = frozenset({
+    "agent", "step", "tool", "workflow", "task", "judge", "retrieval",
+    "handoff", "guardrail", "chain", "custom",
+})
+
+
+class SpanHandle:
+    """Returned by a span scope: add attributes or record the span's output."""
+
+    def __init__(self, span_id: str, trace_id: str) -> None:
+        self.id = span_id
+        self.trace_id = trace_id
+        self._attributes: dict[str, Any] = {}
+        self._output: Any = None
+
+    def set_attribute(self, key: str, value: str | int | float | bool | None) -> None:
+        self._attributes[str(key)] = value
+
+    def set_output(self, value: Any) -> None:
+        self._output = value
+
+
+class _SpanScope:
+    """A span usable as ``with``, ``async with`` or a (sync/async) decorator.
+
+    Spans nest through ContextVars: a span opened inside another becomes its
+    child, and every provider call made inside is attributed to the innermost
+    span. Outside any run, the outermost span starts one.
+    """
+
+    def __init__(
+        self,
+        name: str,
+        kind: str = "custom",
+        *,
+        attributes: Mapping[str, Any] | None = None,
+        input: Any = None,
+        span_id: str | None = None,
+        parent_span_id: str | None = None,
+        context: Mapping[str, Any] | None = None,
+    ) -> None:
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError("span name is required")
+        self.name = name.strip()
+        self.kind = kind if kind in _SPAN_KINDS else "custom"
+        self.attributes = dict(attributes or {})
+        self.input = input
+        self.span_id = span_id
+        self.parent_span_id = parent_span_id
+        self.context = dict(context or {})
+        self._trace_cm: Any = None
+        self._token: Any = None
+        self._previous: dict[str, Any] | None = None
+        self._handle: SpanHandle | None = None
+        self._base: dict[str, Any] = {}
+        self._started: datetime.datetime | None = None
+
+    def _clone(self) -> "_SpanScope":
+        return _SpanScope(
+            self.name, self.kind, attributes=self.attributes, input=self.input,
+            span_id=self.span_id, parent_span_id=self.parent_span_id, context=self.context,
+        )
+
+    def __enter__(self) -> SpanHandle:
+        if not _current_context().get("traceId"):
+            self._trace_cm = start_trace(name=self.name)
+            self._trace_cm.__enter__()
+        ctx = get_context()
+        sid = self.span_id or f"sp_{uuid.uuid4().hex}"
+        inherited = ctx.get("spanId") if ctx.get("spanId") != sid else None
+        child = {**ctx, **_canonical_context(self.context), "spanId": sid}
+        if self.kind == "agent":
+            child["agent"] = self.name
+        if self.kind == "tool":
+            child["tool"] = self.name
+        self._previous = _context.get()
+        self._token = _context.set(child)
+        handle = SpanHandle(sid, str(child.get("traceId")))
+        handle._attributes.update(self.attributes)
+        self._handle = handle
+        self._started = datetime.datetime.now(datetime.timezone.utc)
+        self._base = {
+            "span_id": sid,
+            "trace_id": str(child.get("traceId")),
+            "trace_name": child.get("traceName"),
+            "parent_span_id": self.parent_span_id or inherited,
+            "execution_id": child.get("executionId"),
+            "kind": self.kind,
+            "name": self.name,
+            "started_at": _iso_timestamp(self._started),
+            "context": child,
+        }
+        try:
+            emit_span(**self._base, status="running", attributes=dict(handle._attributes), input=self.input)
+        except Exception:
+            logger.debug("[costkey] span start dropped", exc_info=True)
+        return handle
+
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> bool:
+        try:
+            import asyncio
+            if exc_type is None:
+                status, error = "ok", None
+            elif issubclass(exc_type, asyncio.CancelledError):
+                status, error = "cancelled", None
+            else:
+                status, error = "error", exc_type.__name__
+            ended = datetime.datetime.now(datetime.timezone.utc)
+            handle = self._handle
+            emit_span(
+                **self._base,
+                status=status,
+                ended_at=_iso_timestamp(ended),
+                duration_ms=(ended - (self._started or ended)).total_seconds() * 1000,
+                error_type=error,
+                attributes=dict(handle._attributes) if handle else None,
+                output=handle._output if handle else None,
+            )
+        except Exception:
+            logger.debug("[costkey] span end dropped", exc_info=True)
+        finally:
+            try:
+                _context.reset(self._token)
+            except ValueError:
+                # Closed from a different context (e.g. framework hooks): restore by value.
+                _context.set(self._previous or {})
+            if self._trace_cm is not None:
+                self._trace_cm.__exit__(exc_type, exc, tb)
+        return False
+
+    async def __aenter__(self) -> SpanHandle:
+        return self.__enter__()
+
+    async def __aexit__(self, exc_type: Any, exc: Any, tb: Any) -> bool:
+        return self.__exit__(exc_type, exc, tb)
+
+    def __call__(self, fn: Callable[..., Any]) -> Callable[..., Any]:
+        import functools
+        import inspect
+
+        if inspect.iscoroutinefunction(fn):
+            @functools.wraps(fn)
+            async def async_wrapper(*args: Any, **kwargs: Any) -> Any:
+                async with self._clone() as span:
+                    result = await fn(*args, **kwargs)
+                    span.set_output(result)
+                    return result
+            return async_wrapper
+
+        @functools.wraps(fn)
+        def wrapper(*args: Any, **kwargs: Any) -> Any:
+            with self._clone() as span:
+                result = fn(*args, **kwargs)
+                span.set_output(result)
+                return result
+        return wrapper
+
+
+_SPAN_OPTION_KEYS = frozenset({"attributes", "input", "span_id", "parent_span_id", "context"})
+
+
+def _span_scope(name: str, kind: str, options: dict[str, Any]) -> _SpanScope:
+    # Any keyword that isn't a span option is a context label (user_id=...).
+    labels = {key: value for key, value in options.items() if key not in _SPAN_OPTION_KEYS}
+    known = {key: value for key, value in options.items() if key in _SPAN_OPTION_KEYS}
+    if labels:
+        known["context"] = {**dict(known.get("context") or {}), **labels}
+    return _SpanScope(name, kind, **known)
+
+
+def span(name: str, kind: str = "custom", **options: Any) -> _SpanScope:
+    """Open a span: ``with costkey.span("rerank", kind="retrieval"):``"""
+    return _span_scope(name, kind, options)
+
+
+def agent(name: str, **options: Any) -> _SpanScope:
+    """An agent run. Model calls, tools and sub-agents inside are attributed to it."""
+    return _span_scope(name, "agent", options)
+
+
+def step(name: str, **options: Any) -> _SpanScope:
+    """One step of an agent loop (a turn, a browser action, a plan stage)."""
+    return _span_scope(name, "step", options)
+
+
+def tool(name: str, **options: Any) -> _SpanScope:
+    """A tool call. Its latency and any model calls it makes are attributed to it."""
+    return _span_scope(name, "tool", options)
 
 
 def export_context(*, keys: set[str] | list[str] | tuple[str, ...] | None = None) -> dict[str, Any]:

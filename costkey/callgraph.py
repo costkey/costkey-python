@@ -9,6 +9,7 @@ from collections import deque
 from typing import Any
 
 import httpx
+from costkey.version import __version__
 
 logger = logging.getLogger("costkey")
 
@@ -352,7 +353,7 @@ def scan_and_send(
             }
 
         payload: dict[str, Any] = {
-            "sdkVersion": "python-0.5.1",
+            "sdkVersion": f"python-{__version__}",
             "functions": functions,
         }
 
@@ -380,7 +381,7 @@ def scan_and_send(
             json=payload,
             headers={
                 "Authorization": f"Bearer {auth_key}",
-                "User-Agent": "costkey-python/0.5.1",
+                "User-Agent": f"costkey-python/{__version__}",
             },
             timeout=10,
         )

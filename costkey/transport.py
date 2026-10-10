@@ -12,6 +12,7 @@ from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 import httpx
 from costkey.types import CostKeyEvent
+from costkey.version import __version__
 
 logger = logging.getLogger("costkey")
 
@@ -166,7 +167,7 @@ class Transport:
             return batch
 
     def _send_batch(self, batch: list[dict[str, Any]]) -> bool:
-        payload: dict[str, Any] = {"sdkVersion": "python-0.5.1", "events": batch}
+        payload: dict[str, Any] = {"sdkVersion": f"python-{__version__}", "events": batch}
         if self._release:
             payload["release"] = self._release
 
@@ -176,7 +177,7 @@ class Transport:
                 json=payload,
                 headers={
                     "Authorization": f"Bearer {self._auth_key}",
-                    "User-Agent": "costkey-python/0.5.1",
+                    "User-Agent": f"costkey-python/{__version__}",
                 },
                 timeout=10,
             )
@@ -319,6 +320,16 @@ class Transport:
             d["attemptId"] = event.attempt_id
         if event.parent_event_id is not None:
             d["parentEventId"] = event.parent_event_id
+        if event.span_id is not None:
+            d["spanId"] = event.span_id
+        if event.event_type == "span":
+            d["kind"] = event.span_kind or "custom"
+            d["name"] = event.span_name
+            d["status"] = event.span_status or "running"
+            if event.parent_span_id is not None:
+                d["parentSpanId"] = event.parent_span_id
+            if event.attributes:
+                d["attributes"] = event.attributes
         if event.entity_type is not None:
             d["entityType"] = event.entity_type
         if event.entity_id is not None:

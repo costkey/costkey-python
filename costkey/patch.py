@@ -1,5 +1,6 @@
 """Monkey-patch HTTP clients to intercept AI provider calls."""
 from __future__ import annotations
+import dataclasses
 import json
 import datetime
 import math
@@ -614,29 +615,85 @@ def start_runtime_config_fetch(
     worker.start()
 
 
-def _is_streaming_request(request_body: Any) -> bool:
-    if isinstance(request_body, dict):
-        return request_body.get("stream") is True
+_STREAM_PATH = re.compile(r"(:streamGenerateContent$|/invoke-with-response-stream$|/converse-stream$)")
+
+
+def _is_streaming_request(request_body: Any, url: str | None = None) -> bool:
+    """Streaming is declared in the body (OpenAI-style) or the URL (Gemini, Bedrock)."""
+    if isinstance(request_body, dict) and request_body.get("stream") is True:
+        return True
+    if url:
+        try:
+            from urllib.parse import urlparse, parse_qs
+            parsed = urlparse(url)
+            if _STREAM_PATH.search(parsed.path):
+                return True
+            if parse_qs(parsed.query).get("alt") == ["sse"]:
+                return True
+        except Exception:
+            return False
     return False
 
 
 def _extract_sse_usage(text: str, extractor: Any) -> NormalizedUsage | None:
-    lines = text.split("\n")
-    for i in range(len(lines) - 1, -1, -1):
-        line = lines[i]
-        if not line.startswith("data: "):
+    """Merge usage across a whole SSE stream.
+
+    OpenAI chat reports usage in the final chunk, the Responses API under
+    ``response.completed``'s ``response``, Anthropic input in ``message_start``
+    and output in ``message_delta``, Gemini cumulatively on every chunk. Each
+    field keeps its largest reported value, which is correct for all of them.
+    """
+    merged: NormalizedUsage | None = None
+    for raw in text.split("\n"):
+        line = raw.lstrip()
+        if not line.startswith("data:"):
             continue
-        data = line[6:].strip()
-        if data == "[DONE]":
+        data = line[5:].strip()
+        if not data or data == "[DONE]":
             continue
         try:
             parsed = json.loads(data)
-            usage = extractor.extract_usage(parsed)
-            if usage:
-                return usage
         except Exception:
             continue
-    return None
+        if not isinstance(parsed, dict):
+            continue
+        for candidate in (parsed, parsed.get("response"), parsed.get("message")):
+            if not isinstance(candidate, dict):
+                continue
+            try:
+                usage = extractor.extract_usage(candidate)
+            except Exception:
+                usage = None
+            if usage:
+                merged = _merge_usage(merged, usage)
+    if merged and merged.total_tokens is None and merged.input_tokens is not None and merged.output_tokens is not None:
+        merged.total_tokens = merged.input_tokens + merged.output_tokens
+    return merged
+
+
+def _merge_usage(current: NormalizedUsage | None, nxt: NormalizedUsage) -> NormalizedUsage:
+    if current is None:
+        return dataclasses.replace(nxt)
+
+    def pick(a: Any, b: Any) -> Any:
+        if a is None:
+            return b
+        if b is None:
+            return a
+        return max(a, b)
+
+    merged = dataclasses.replace(current)
+    for name in ("input_tokens", "output_tokens", "reasoning_tokens", "cache_read_tokens",
+                 "cache_creation_tokens", "cost_usd", "image_output_tokens"):
+        if hasattr(merged, name):
+            setattr(merged, name, pick(getattr(current, name, None), getattr(nxt, name, None)))
+    total = pick(current.total_tokens, nxt.total_tokens)
+    if merged.input_tokens is not None and merged.output_tokens is not None:
+        total = max(total or 0, merged.input_tokens + merged.output_tokens)
+    merged.total_tokens = total
+    if getattr(nxt, "native_units", None) or getattr(current, "native_units", None):
+        merged.native_units = {**(getattr(current, "native_units", None) or {}), **(getattr(nxt, "native_units", None) or {})}
+    return merged
 
 
 def _extract_sse_model(text: str, request_body: Any, extractor: Any) -> str | None:
@@ -837,17 +894,36 @@ def _provider_value(provider: Any) -> str:
     return str(value)
 
 
-def _estimate_request_usage(request_body: Any) -> dict[str, int]:
-    """Return a conservative, body-only estimate for policy admission."""
-    if not isinstance(request_body, dict):
-        return {}
+def _estimate_request_usage(request_body: Any, raw_body: Any = None) -> dict[str, int]:
+    """Per-call bounds for enforced budgets.
+
+    Input is bounded by the request's byte size (a token is never smaller than
+    one byte of request text); output by the request's own max-token setting.
+    """
     usage: dict[str, int] = {}
-    max_tokens = request_body.get("max_tokens")
-    if isinstance(max_tokens, int) and not isinstance(max_tokens, bool) and max_tokens >= 0:
-        usage["outputTokens"] = max_tokens
-    max_completion = request_body.get("max_completion_tokens")
-    if isinstance(max_completion, int) and not isinstance(max_completion, bool) and max_completion >= 0:
-        usage["outputTokens"] = max_completion
+    raw: bytes | None = None
+    if isinstance(raw_body, (bytes, bytearray)):
+        raw = bytes(raw_body)
+    elif isinstance(raw_body, str):
+        raw = raw_body.encode("utf-8")
+    elif request_body is not None:
+        try:
+            raw = json.dumps(request_body).encode("utf-8")
+        except Exception:
+            raw = None
+    if raw:
+        usage["maxInputTokens"] = len(raw)
+    if isinstance(request_body, dict):
+        generation = request_body.get("generationConfig") if isinstance(request_body.get("generationConfig"), dict) else {}
+        inference = request_body.get("inferenceConfig") if isinstance(request_body.get("inferenceConfig"), dict) else {}
+        for value in (
+            request_body.get("max_tokens"), request_body.get("max_completion_tokens"),
+            request_body.get("max_output_tokens"), generation.get("maxOutputTokens"),
+            inference.get("maxTokens"),
+        ):
+            if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+                usage["maxOutputTokens"] = value
+                break
     return usage
 
 
@@ -1025,7 +1101,7 @@ def _patch_httpx() -> None:
                 except Exception:
                     pass
 
-            is_streaming = _is_streaming_request(request_body) or kwargs.get("stream", False)
+            is_streaming = _is_streaming_request(request_body, url) or kwargs.get("stream", False)
 
             event_id = uuid.uuid4().hex
             request_model = extractor.extract_model(request_body, None)
@@ -1039,7 +1115,7 @@ def _patch_httpx() -> None:
                 "context": _safe_admission_context(ctx),
                 # Admission deliberately receives metadata only; request
                 # bodies and credentials never leave the application here.
-                "usageBounds": _estimate_request_usage(request_body),
+                "usageBounds": _estimate_request_usage(request_body, request.content),
                 "streaming": is_streaming,
             })
 
@@ -1102,7 +1178,7 @@ def _patch_httpx() -> None:
                 except Exception:
                     pass
 
-            is_streaming = _is_streaming_request(request_body) or kwargs.get("stream", False)
+            is_streaming = _is_streaming_request(request_body, url) or kwargs.get("stream", False)
 
             event_id = uuid.uuid4().hex
             request_model = extractor.extract_model(request_body, None)
@@ -1114,7 +1190,7 @@ def _patch_httpx() -> None:
                 "provider": _provider_value(extractor.provider),
                 "model": request_model,
                 "context": _safe_admission_context(ctx),
-                "usageBounds": _estimate_request_usage(request_body),
+                "usageBounds": _estimate_request_usage(request_body, request.content),
                 "streaming": is_streaming,
             })
 
@@ -1387,6 +1463,7 @@ def _patch_requests() -> None:
                 except Exception:
                     pass
 
+            is_streaming = _is_streaming_request(request_body, url) or bool(kwargs.get("stream", False))
             event_id = uuid.uuid4().hex
             request_model = extractor.extract_model(request_body, None)
             admission_decision = _run_admission_sync({
@@ -1397,8 +1474,8 @@ def _patch_requests() -> None:
                 "provider": _provider_value(extractor.provider),
                 "model": request_model,
                 "context": _safe_admission_context(ctx),
-                "usageBounds": _estimate_request_usage(request_body),
-                "streaming": _is_streaming_request(request_body),
+                "usageBounds": _estimate_request_usage(request_body, request.body),
+                "streaming": is_streaming,
             })
 
             try:
@@ -1408,10 +1485,14 @@ def _patch_requests() -> None:
                 raise
             duration_ms = (time.perf_counter() - start) * 1000
 
-            try:
-                response_body = response.json()
-            except Exception:
-                response_body = None
+            # Reading a streamed requests response here would buffer the whole
+            # stream before the caller sees it; record the call without usage.
+            response_body = None
+            if not is_streaming:
+                try:
+                    response_body = response.json()
+                except Exception:
+                    response_body = None
             usage = extractor.extract_usage(response_body) if response_body else None
 
             _process(extractor, url, request.method, response.status_code,
@@ -1465,9 +1546,14 @@ def _process(extractor: Any, url: str, method: str, status_code: int | None,
         request_model = extractor.extract_model(request_body, None)
 
         should_capture = _state.capture_body if capture_body is None else capture_body
+        resolved_id = event_id or uuid.uuid4().hex
+        # Calls are stamped when they started: now minus the measured duration.
+        started_at = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(milliseconds=max(duration_ms, 0))
+        attempt_label = ctx.get("attemptId", ctx.get("attempt_id"))
+        parent_event = ctx.get("parentEventId", ctx.get("parent_event_id"))
         event = CostKeyEvent(
-            id=event_id or uuid.uuid4().hex,
-            timestamp=datetime.datetime.now(datetime.timezone.utc).isoformat(timespec='milliseconds').replace('+00:00', 'Z'),
+            id=resolved_id,
+            timestamp=started_at.isoformat(timespec='milliseconds').replace('+00:00', 'Z'),
             project_id=_state.project_id,
             provider=extractor.provider,
             model=model,
@@ -1504,7 +1590,9 @@ def _process(extractor: Any, url: str, method: str, status_code: int | None,
             request_model=request_model if request_model != model else None,
             charge_id=response_charge_id,
             provider_request_id=response_charge_id,
-            attempt_id=event_id,
+            attempt_id=attempt_label if isinstance(attempt_label, str) and attempt_label.strip() else resolved_id,
+            parent_event_id=parent_event if isinstance(parent_event, str) and parent_event.strip() else None,
+            span_id=ctx.get("spanId") if isinstance(ctx.get("spanId"), str) else None,
         )
 
         _dispatch_event(event, legacy_hook=True)
@@ -1632,6 +1720,73 @@ def emit_lifecycle(
     # transport also promotes standard identity fields from that context.
     _dispatch_event(event)
     return event_id
+
+
+_MAX_SPAN_PAYLOAD_CHARS = 2000
+
+
+def _span_payload(value: Any) -> str | None:
+    """Span input/output are content: bounded, scrubbed, capture-only."""
+    if value is None:
+        return None
+    try:
+        text = value if isinstance(value, str) else json.dumps(value, default=str)
+    except Exception:
+        return None
+    text = _scrub(text)
+    if not isinstance(text, str):
+        return None
+    return text if len(text) <= _MAX_SPAN_PAYLOAD_CHARS else text[:_MAX_SPAN_PAYLOAD_CHARS] + "…"
+
+
+def emit_span(
+    *,
+    span_id: str,
+    trace_id: str,
+    kind: str,
+    name: str,
+    status: str,
+    started_at: str,
+    context: dict[str, Any],
+    trace_name: str | None = None,
+    parent_span_id: str | None = None,
+    execution_id: str | None = None,
+    ended_at: str | None = None,
+    duration_ms: float | None = None,
+    error_type: str | None = None,
+    attributes: dict[str, Any] | None = None,
+    input: Any = None,
+    output: Any = None,
+) -> None:
+    """Enqueue one delivery of an agent/step/tool span (start or end)."""
+    attrs = dict(attributes or {})
+    if _state.capture_body:
+        for key, value in (("input", input), ("output", output)):
+            payload = _span_payload(value)
+            if payload is not None:
+                attrs[key] = payload
+    event = CostKeyEvent(
+        id=span_id,
+        timestamp=ended_at or started_at,
+        project_id=_state.project_id,
+        provider=Provider.UNKNOWN,
+        event_type="span",
+        source="explicit",
+        started_at=started_at,
+        ended_at=ended_at,
+        duration_ms=round(duration_ms or 0, 2),
+        error_type=error_type,
+        context=_scrub(dict(context)),
+        trace_id=trace_id,
+        trace_name=trace_name,
+        execution_id=execution_id,
+        parent_span_id=parent_span_id,
+        span_kind=kind,
+        span_name=name,
+        span_status=status,
+        attributes=_scrub(attrs) if attrs else None,
+    )
+    _dispatch_event(event)
 
 
 def get_context() -> dict[str, Any]:

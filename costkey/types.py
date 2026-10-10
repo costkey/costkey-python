@@ -129,6 +129,13 @@ class CostKeyEvent:
     trace_id: str | None = None
     trace_name: str | None = None
     provider_request_id: str | None = None
+    # Agent/step/tool spans: calls carry span_id; span events carry the rest.
+    span_id: str | None = None
+    parent_span_id: str | None = None
+    span_kind: str | None = None
+    span_name: str | None = None
+    span_status: str | None = None
+    attributes: dict[str, Any] | None = None
 
 
 @dataclass
