@@ -117,6 +117,34 @@ with costkey.with_context(feature="search", team="growth", customer_id="cus_123"
     )
 ```
 
+## Agents
+
+Record an agent run as a tree of spans. Model calls are attributed to the
+innermost span, and the run page shows cost and latency at each level.
+
+```py
+with costkey.agent("dash", user_id=user.id) as span:
+    span.set_attribute("model", "gpt-5.1")
+    with costkey.tool("get_holdings"):
+        holdings = get_holdings(user.id)
+```
+
+Framework hooks:
+
+```py
+# OpenAI Agents SDK
+from costkey.integrations.openai_agents import CostKeyRunHooks
+result = await Runner.run(agent, user_input, hooks=CostKeyRunHooks())
+
+# browser-use
+from costkey.integrations.browser_use import step_hooks
+on_step_start, on_step_end = step_hooks()
+with costkey.agent("browser-agent"):
+    await browser_agent.run(on_step_start=on_step_start, on_step_end=on_step_end)
+```
+
+See [Agents and tools](https://costkey.dev/docs/agents).
+
 ## Grouped work and explicit usage
 
 Use one stable group name for repeatable work; each invocation gets a fresh
@@ -272,6 +300,8 @@ costkey.register_extractor(InternalGatewayExtractor())
 | `costkey.shutdown()` | Flush and restore patched clients |
 | `costkey.flush()` | Flush buffered events |
 | `costkey.with_context(**context)` | Attach metadata to nested AI calls |
+| `costkey.agent / step / tool(name, **options)` | Agent, step or tool span (context manager or decorator) |
+| `costkey.span(name, kind=..., **options)` | A span of any kind |
 | `costkey.start_trace(name=None, trace_id=None)` | Group calls into one trace |
 | `costkey.start_execution(name, kind="batch", execution_id=None)` | Group repeatable work with a fresh invocation ID |
 | `costkey.record_usage(...)` | Report deduplicated external/native usage with delta or cumulative semantics |
