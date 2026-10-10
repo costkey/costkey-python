@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "costkey"
 version = "0.5.1"
-description = "AI cost observability. Track every LLM call's cost, tokens, latency, prompts, and tool metadata with one CLI command."
+description = "AI cost observability for supported provider calls: cost, tokens, latency, prompts, and tool metadata without an extra provider-routing hop."
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.9"
@@ -39,6 +39,13 @@ Changelog = "https://github.com/costkey/costkey-python/releases"
 
 [tool.hatch.build.targets.wheel]
 packages = ["costkey"]
+
+[tool.hatch.build.targets.sdist]
+# The source archive is a distributable package boundary, not a checkout
+# snapshot. Keep tests, local benchmarks, CI metadata, caches, and artifacts
+# out of it (the wheel already contains only the package).
+include = ["costkey", "README.md", "pyproject.toml"]
+exclude = ["tests", "scripts", ".github", "dist", ".venv*", ".DS_Store", "**/.DS_Store", ".pytest_cache", ".conductor"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -4,7 +4,10 @@
 [![CI](https://github.com/costkey/costkey-python/actions/workflows/ci.yml/badge.svg)](https://github.com/costkey/costkey-python/actions/workflows/ci.yml)
 [![MIT](https://img.shields.io/badge/license-MIT-black.svg)](LICENSE)
 
-AI cost observability for Python. CostKey tracks every LLM call's cost, tokens, latency, prompts, tool calls, and code location without proxying your traffic.
+AI cost observability for Python. CostKey tracks supported provider calls'
+cost, tokens, latency, prompts, tool calls, and code location without adding a
+provider-routing hop. Endpoint coverage is explicit; framework-native
+components use `record_usage` when HTTP capture does not apply.
 
 ```bash
 pipx run costkey setup
@@ -14,10 +17,10 @@ Your provider dashboard says you spent $2,000. CostKey tells you `generate_summa
 
 ## Why CostKey
 
-Most AI observability tools make you route traffic through a proxy or wrap every provider client. CostKey instruments `httpx` and `requests` in-process, detects AI provider requests, captures the useful metadata, and ships events asynchronously to the CostKey dashboard.
+Most AI observability tools make you route traffic through a proxy or wrap every provider client. CostKey instruments supported `httpx` and `requests` calls in-process, detects configured AI provider endpoints, captures useful metadata, and ships events asynchronously to the CostKey dashboard.
 
-- **No proxy** - zero added network hop and no provider migration.
-- **No wrappers** - keep using OpenAI, Anthropic, Gemini, LangChain, LiteLLM, or your own gateway.
+- **No extra provider-routing hop** - provider traffic stays on its existing path; CostKey adds local interception and asynchronous telemetry. Explicit enforcement performs a separate admission decision.
+- **No provider-client wrappers** - keep using OpenAI, Anthropic, Gemini, LangChain, LiteLLM, or your own gateway.
 - **Code attribution** - see function, file, line, release, and stack trace for expensive calls.
 - **Prompt and tool visibility** - inspect system prompts, messages, tool definitions, tool calls, tool results, citations, and provider metadata.
 - **Trace grouping** - group calls from the same user action, request, or agent run.
@@ -47,7 +50,8 @@ import costkey
 costkey.init(dsn=os.environ["COSTKEY_DSN"])
 ```
 
-Initialize CostKey before your first AI call. After that, provider calls made through `httpx` or `requests` are tracked automatically.
+Initialize CostKey before your first AI call. After that, supported provider
+calls made through `httpx` or `requests` are tracked automatically.
 
 ## No-Code Bootstrap
 
@@ -61,12 +65,12 @@ The bootstrap reads:
 
 - `COSTKEY_DSN`
 - `COSTKEY_RELEASE`
-- `COSTKEY_CAPTURE_BODY=false`
+- `COSTKEY_CAPTURE_BODY=false` (unset leaves the server project setting in control)
 - `COSTKEY_DEBUG=true`
 
 ## What Shows Up
 
-Every captured event can include:
+Captured provider events can include:
 
 | Data | Example |
 | --- | --- |
@@ -113,6 +117,84 @@ with costkey.with_context(feature="search", team="growth", customer_id="cus_123"
     )
 ```
 
+## Grouped work and explicit usage
+
+Use one stable group name for repeatable work; each invocation gets a fresh
+execution ID and lifecycle receipt. If the runner knows item counts, pass
+`expected_items`, `completed_items`, and `failed_items`; they are carried on
+both lifecycle records:
+
+```py
+with costkey.start_execution(
+    name="nightly-document-import",
+    kind="batch",
+    expected_items=100,
+    completed_items=98,
+    failed_items=2,
+):
+    with costkey.start_trace(name="document-42"):
+        import_document(42)
+```
+
+Adapters for components that are not observed through supported HTTP clients
+report a caller-owned identity and monotonic revision. Cumulative snapshots
+replace the prior snapshot; they are not summed:
+
+```py
+costkey.record_usage(
+    event_id="voice-session-42:stt:r7",
+    component_id="voice-session-42:stt",
+    provider="deepgram",
+    model="nova-3",
+    usage={"audioSeconds": 12.4},
+    aggregation="cumulative",
+    revision=7,
+)
+```
+
+For a verified LiveKit `session_usage_updated` callback, use
+`costkey.livekit.record_livekit_usage(update, session_id=..., revision=...)`.
+This reports the observed STT/LLM/TTS components under one session; it does
+not intercept arbitrary voice traffic, and omitted components remain partial.
+
+```py
+from costkey.livekit import record_livekit_usage
+
+@session.on("session_usage_updated")
+def on_usage(ev):
+    # ev.usage.model_usage is a cumulative list of typed provider/model rows.
+    record_livekit_usage(
+        ev,
+        session_id=session.room.name,
+        revision=next_revision(),  # supplied by the application adapter
+        expected_components=("stt", "llm", "tts"),
+    )
+```
+
+The adapter preserves Python's native duration unit (seconds), token fields,
+characters and provider/model identity. It does not treat a final session
+report as a second charge for the same revision.
+
+LiveKit's usage classes do not include provider prices. Supply
+`declared_amounts`/`declared_pricing_ids` when the application has an explicit
+rate basis; these amounts are marked estimated and are never inferred from
+duration or token counts.
+
+When HTTP auto-capture already records the underlying LLM requests, use
+`exclude_components={"llm"}` so the session aggregate does not double-count
+them; session totals and individual request IDs are different granularities.
+If the same LLM provider request is also auto-captured, make the session
+snapshot the source of charge for that scoped request with
+`with costkey.with_context(costkeyCapture="manual"):` so it is not counted at
+both HTTP and session granularity. Only use this when the integration has
+verified that the session snapshot covers that request.
+
+To cross a trusted service or queue boundary, explicitly attach the
+allowlisted carrier returned by `costkey.export_context()` (or its JSON header
+form from `costkey.export_context_headers()`) and import it with
+`costkey.with_context(...)`. Context is never automatically added to unrelated
+outbound URLs.
+
 ## Streaming
 
 Streaming responses are fully supported. The SDK wraps `httpx` response iteration to capture:
@@ -126,7 +208,13 @@ Non-AI HTTP calls pass through untouched.
 
 ## Privacy
 
-CostKey never reads request headers, so API keys are not captured. Request and response bodies are captured by default because they power debugging and prompt/tool inspection.
+CostKey does not capture provider authorization headers. It reads only the
+explicit `x-costkey-context`/legacy trace headers used for a trusted handoff,
+then removes those headers before the provider request. Body and prompt
+capture starts metadata-only until the project runtime config confirms text
+capture; an explicit `capture_body=False` always wins. The DSN config is
+refreshed periodically (customize with `config_refresh_interval`) so a remote
+revocation returns future calls to metadata-only capture.
 
 Redact before anything leaves your process:
 
@@ -185,6 +273,11 @@ costkey.register_extractor(InternalGatewayExtractor())
 | `costkey.flush()` | Flush buffered events |
 | `costkey.with_context(**context)` | Attach metadata to nested AI calls |
 | `costkey.start_trace(name=None, trace_id=None)` | Group calls into one trace |
+| `costkey.start_execution(name, kind="batch", execution_id=None)` | Group repeatable work with a fresh invocation ID |
+| `costkey.record_usage(...)` | Report deduplicated external/native usage with delta or cumulative semantics |
+| `costkey.export_context()` | Export an explicit allowlisted carrier for trusted handoff |
+| `costkey.export_context_headers()` | Encode that carrier for an explicitly trusted request |
+| `costkey.get_runtime_config_status()` | Inspect metadata-safe runtime capture config state |
 | `costkey.register_extractor(extractor)` | Add custom provider detection |
 | `costkey.register_pricing(model, pricing)` | Add custom model pricing |
 

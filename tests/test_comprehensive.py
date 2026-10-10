@@ -70,6 +70,18 @@ class TestOpenAIUsage:
         assert usage.output_tokens == 5000
         assert usage.reasoning_tokens == 4500
 
+    def test_with_top_level_reasoning_tokens(self):
+        usage = OpenAIExtractor().extract_usage({
+            "model": "o1-mini",
+            "usage": {
+                "prompt_tokens": 10,
+                "completion_tokens": 20,
+                "reasoning_tokens": 15,
+            },
+        })
+        assert usage is not None
+        assert usage.reasoning_tokens == 15
+
     def test_with_output_tokens_details(self):
         """Some newer OpenAI models use output_tokens_details instead."""
         ext = OpenAIExtractor()
