@@ -2634,6 +2634,37 @@ def emit_span(
     _dispatch_event(event)
 
 
+def emit_score(
+    *,
+    score_id: str,
+    name: str,
+    value: float,
+    timestamp: str,
+    trace_id: str | None = None,
+    span_id: str | None = None,
+    label: str | None = None,
+    comment: str | None = None,
+    source: str | None = None,
+) -> bool:
+    """Enqueue one judge/human/code score. The comment is content: capture only."""
+    event = CostKeyEvent(
+        id=score_id,
+        timestamp=timestamp,
+        project_id=_state.project_id,
+        provider=Provider.UNKNOWN,
+        event_type="score",
+        # The envelope source carries the score's origin for score events.
+        source=source or "explicit",
+        trace_id=trace_id,
+        span_id=span_id,
+        score_name=name,
+        score_value=value,
+        score_label=label,
+        score_comment=comment if _state.capture_body else None,
+    )
+    return _dispatch_event(event)
+
+
 def get_context() -> dict[str, Any]:
     # Return a copy so callers cannot mutate the ContextVar value shared by
     # sibling tasks created from the same context.

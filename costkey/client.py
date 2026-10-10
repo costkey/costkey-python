@@ -21,6 +21,7 @@ from costkey.patch import (
     get_context,
     emit_lifecycle,
     emit_span,
+    emit_score,
     _dispatch_event,
     _scrub,
     start_runtime_config_fetch,
@@ -862,6 +863,66 @@ def step(name: str, **options: Any) -> _SpanScope:
 def tool(name: str, **options: Any) -> _SpanScope:
     """A tool call. Its latency and any model calls it makes are attributed to it."""
     return _span_scope(name, "tool", options)
+
+
+_MAX_SCORE_NAME_CHARS = 120
+_MAX_SCORE_LABEL_CHARS = 60
+_MAX_SCORE_COMMENT_CHARS = 1000
+_SCORE_SOURCES = frozenset({"judge", "human", "code"})
+
+
+def score(
+    name: str,
+    value: float,
+    *,
+    label: str | None = None,
+    comment: str | None = None,
+    source: str | None = None,
+    trace_id: str | None = None,
+    span_id: str | None = None,
+    id: str | None = None,
+    timestamp: Any = None,
+) -> None:
+    """Record a judge, human or code score on a run.
+
+    Inside a trace or span the score attaches to it; otherwise pass
+    ``trace_id``. Sending the same ``id`` again replaces the earlier score.
+    Invalid input raises ``ValueError``; before ``init`` the call is a no-op.
+    """
+    score_name = _non_empty(name)
+    if not score_name:
+        raise ValueError("costkey.score() requires a non-empty name")
+    if len(score_name) > _MAX_SCORE_NAME_CHARS:
+        raise ValueError(f"costkey.score() name must be at most {_MAX_SCORE_NAME_CHARS} characters")
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+        raise ValueError("costkey.score() value must be a finite number")
+    score_label = _non_empty(label)
+    if score_label and len(score_label) > _MAX_SCORE_LABEL_CHARS:
+        raise ValueError(f"costkey.score() label must be at most {_MAX_SCORE_LABEL_CHARS} characters")
+    if source is not None and source not in _SCORE_SOURCES:
+        raise ValueError("costkey.score() source must be judge, human or code")
+    current = _current_context()
+    explicit_trace = _non_empty(trace_id)
+    resolved_trace = explicit_trace or _non_empty(current.get("traceId"))
+    # A score for another run never inherits the current span.
+    resolved_span = _non_empty(span_id) or (None if explicit_trace else _non_empty(current.get("spanId")))
+    if not resolved_trace and not resolved_span:
+        raise ValueError("costkey.score() needs a run: call it inside a trace or span, or pass trace_id")
+    score_comment = _non_empty(comment)
+    from costkey.patch import _state
+    if not _state.transport or not _state.project_id:
+        return
+    emit_score(
+        score_id=_non_empty(id) or f"sc_{uuid.uuid4().hex}",
+        name=score_name,
+        value=float(value),
+        timestamp=_iso_timestamp(timestamp),
+        trace_id=resolved_trace,
+        span_id=resolved_span,
+        label=score_label,
+        comment=score_comment[:_MAX_SCORE_COMMENT_CHARS] if score_comment else None,
+        source=source,
+    )
 
 
 def export_context(*, keys: set[str] | list[str] | tuple[str, ...] | None = None) -> dict[str, Any]:

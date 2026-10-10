@@ -170,6 +170,11 @@ class CostKeyEvent:
     span_name: str | None = None
     span_status: str | None = None
     attributes: dict[str, Any] | None = None
+    # Judge/eval scores on a run (event_type == "score").
+    score_name: str | None = None
+    score_value: float | None = None
+    score_label: str | None = None
+    score_comment: str | None = None
 
 
 @dataclass

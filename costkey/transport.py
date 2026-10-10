@@ -330,6 +330,13 @@ class Transport:
                 d["parentSpanId"] = event.parent_span_id
             if event.attributes:
                 d["attributes"] = event.attributes
+        if event.event_type == "score":
+            d["name"] = event.score_name
+            d["value"] = event.score_value
+            if event.score_label is not None:
+                d["label"] = event.score_label
+            if event.score_comment is not None:
+                d["comment"] = event.score_comment
         if event.entity_type is not None:
             d["entityType"] = event.entity_type
         if event.entity_id is not None:
