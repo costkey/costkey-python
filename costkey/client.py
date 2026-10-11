@@ -63,7 +63,7 @@ _EXPORT_CONTEXT_KEYS = frozenset({
 def _parse_dsn(dsn: str) -> tuple[str, str, str]:
     """Parse DSN → (endpoint, auth_key, project_id).
 
-    Expected format: http(s)://<key>@<your CostKey host>/<project-id>
+    Expected format: http(s)://<key>@<your CostKey host>[/<base-path>]/<project-id>
     """
     from urllib.parse import urlparse
 
@@ -81,13 +81,18 @@ def _parse_dsn(dsn: str) -> tuple[str, str, str]:
     if not auth_key:
         raise ValueError(f"[costkey] DSN missing auth key. {_DSN_HELP}")
 
-    project_id = parsed.path.lstrip("/")
+    # The project ID is the last path segment. Anything before it is the path
+    # CostKey is served under, e.g. https://<key>@portal.example.com/costkey/<project-id>.
+    segments = [part for part in parsed.path.split("/") if part]
+    project_id = segments.pop() if segments else ""
     if not project_id:
         raise ValueError(f"[costkey] DSN missing project ID. {_DSN_HELP}")
 
     endpoint = f"{parsed.scheme}://{parsed.hostname}"
     if parsed.port:
         endpoint += f":{parsed.port}"
+    if segments:
+        endpoint += "/" + "/".join(segments)
     endpoint += "/api/v1/events"
     return endpoint, auth_key, project_id
 
