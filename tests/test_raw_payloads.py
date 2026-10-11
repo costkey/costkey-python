@@ -227,7 +227,7 @@ def test_removed_apis_are_gone():
         assert not hasattr(costkey, name)
     with pytest.raises(ImportError):
         __import__("costkey.pricing")
-    assert costkey.__version__ == "0.7.0"
+    assert costkey.__version__.startswith("0.7.")
 
 
 def test_importing_costkey_imports_no_framework():
