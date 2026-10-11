@@ -25,7 +25,7 @@ def _arg(args: list[str], name: str) -> str | None:
 
 
 def _host(args: list[str]) -> str:
-    return _arg(args, "--host") or os.environ.get("COSTKEY_HOST") or "https://app.costkey.dev"
+    return _arg(args, "--host") or os.environ.get("COSTKEY_HOST") or "http://localhost:4100"
 
 
 def _load_token(args: list[str]) -> str | None:
@@ -360,12 +360,15 @@ def main() -> None:
         """costkey
 
 Usage:
-  costkey setup [--name <project-name>] [--dsn <dsn>]
+  costkey setup [--host <your CostKey URL>] [--name <project-name>] [--dsn <dsn>]
+
+The host defaults to http://localhost:4100, a local self-hosted install.
+Set --host or COSTKEY_HOST for any other address.
 
 Examples:
   pipx run costkey setup
   pipx run costkey setup --name my-app
-  pipx run costkey setup --dsn https://ck_key@app.costkey.dev/project_id
+  pipx run costkey setup --dsn http://ck_key@localhost:4100/project_id
 """
     )
 

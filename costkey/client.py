@@ -71,11 +71,11 @@ _EXPORT_CONTEXT_KEYS = frozenset({
 def _parse_dsn(dsn: str) -> tuple[str, str, str]:
     """Parse DSN → (endpoint, auth_key, project_id).
 
-    Expected format: https://<key>@app.costkey.dev/<project-id>
+    Expected format: http(s)://<key>@<your CostKey host>/<project-id>
     """
     from urllib.parse import urlparse
 
-    _DSN_HELP = 'Invalid DSN format. Expected: https://<key>@app.costkey.dev/<project-id>  Get your DSN at https://app.costkey.dev'
+    _DSN_HELP = 'Invalid DSN format. Expected: http(s)://<key>@<your CostKey host>/<project-id>. Find it in your CostKey console under Settings, Projects.'
 
     if not dsn or not isinstance(dsn, str):
         raise ValueError(f"[costkey] {_DSN_HELP}")
@@ -331,7 +331,7 @@ def init(dsn: str | None = None, *, capture_body: bool | None = None,
     Initialize CostKey. Call once at app startup.
 
     >>> import costkey
-    >>> costkey.init(dsn="https://ck_abc123@app.costkey.dev/my-project")
+    >>> costkey.init(dsn="http://ck_abc123@localhost:4100/my-project")
     >>> # That's it. Supported provider calls are observed in-process.
 
     If no DSN is provided, falls back to COSTKEY_DSN env var.

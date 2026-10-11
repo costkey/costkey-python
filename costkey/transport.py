@@ -183,7 +183,7 @@ class Transport:
             )
             if resp.status_code in (401, 403):
                 # Auth failure — always log (not just debug)
-                logger.warning(f"[costkey] Authentication failed ({resp.status_code}). Check your DSN at https://app.costkey.dev/settings")
+                logger.warning(f"[costkey] Authentication failed ({resp.status_code}). Check the DSN under Settings, Projects in your CostKey console")
             elif resp.status_code == 429:
                 # Rate limited — put events back
                 self._requeue(batch)

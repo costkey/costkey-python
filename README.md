@@ -377,7 +377,7 @@ PyPI must have trusted publishing configured for `costkey/costkey-python` and th
 ## Links
 
 - Docs: https://costkey.dev/docs
-- Dashboard: https://app.costkey.dev
+- Self-hosting: https://costkey.dev/docs/self-hosting/
 - PyPI: https://pypi.org/project/costkey/
 - TypeScript SDK: https://github.com/costkey/costkey
 

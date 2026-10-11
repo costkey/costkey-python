@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "costkey"
-version = "0.6.0"
+version = "0.6.1"
 description = "AI cost observability for supported provider calls: cost, tokens, latency, prompts, and tool metadata without an extra provider-routing hop."
 readme = "README.md"
 license = "MIT"
