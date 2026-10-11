@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "costkey"
-version = "0.7.1"
+version = "0.7.2"
 description = "AI cost observability: captures raw telemetry from AI provider calls and agent frameworks; CostKey's server does the pricing and analysis."
 readme = "README.md"
 license = "MIT"
@@ -30,7 +30,7 @@ dependencies = [
 [project.optional-dependencies]
 # Framework integrations (costkey.integrations.*). Each is imported lazily;
 # `import costkey` never imports a framework.
-openai-agents = ["openai-agents>=0.23"]
+openai-agents = ["openai-agents>=0.22"]
 langchain = ["langchain-core>=1.0"]
 langgraph = ["langchain-core>=1.0", "langgraph>=1.0"]
 crewai = ["crewai>=1.15"]
