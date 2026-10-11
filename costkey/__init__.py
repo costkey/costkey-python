@@ -1,3 +1,4 @@
+"""CostKey: AI cost observability. The SDK only sends raw telemetry."""
 from costkey.client import (
     init,
     shutdown,
@@ -6,7 +7,6 @@ from costkey.client import (
     start_trace,
     start_execution,
     record_usage,
-    score,
     export_context,
     export_context_headers,
     import_context,
@@ -18,7 +18,6 @@ from costkey.client import (
     tool,
     SpanHandle,
 )
-from costkey.client import register_extractor, register_pricing
 from costkey.policy import CostKeyPolicyRefused, PolicyAdmissionOptions, PolicyOptions
 from costkey.livekit import record_livekit_usage, record_livekit_session_usage
 
@@ -31,7 +30,6 @@ __all__ = [
     "start_trace",
     "start_execution",
     "record_usage",
-    "score",
     "export_context",
     "export_context_headers",
     "import_context",
@@ -47,6 +45,5 @@ __all__ = [
     "PolicyOptions",
     "record_livekit_usage",
     "record_livekit_session_usage",
-    "register_extractor",
-    "register_pricing",
+    "__version__",
 ]

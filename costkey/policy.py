@@ -122,15 +122,17 @@ class PolicyAdmissionOptions:
             request["usageBounds"] = dict(self.usage_bounds)
         if self.claimed_cost_usd is not None:
             request["claimedCostUsd"] = self.claimed_cost_usd
-        response = httpx.post(
-            self.endpoint,
-            json=request,
-            headers={
-                "Authorization": f"Bearer {self.auth_key}",
-                "Content-Type": "application/json",
-            },
-            timeout=self.timeout,
-        )
+        from costkey.patch import internal_http
+        with internal_http():
+            response = httpx.post(
+                self.endpoint,
+                    json=request,
+                headers={
+                    "Authorization": f"Bearer {self.auth_key}",
+                    "Content-Type": "application/json",
+                },
+                timeout=self.timeout,
+            )
         try:
             body = response.json()
         except Exception:
@@ -157,15 +159,17 @@ class PolicyAdmissionOptions:
         endpoint = self.endpoint.rstrip("/")
         if endpoint.endswith("/admit"):
             endpoint = endpoint[:-len("/admit")] + "/settle"
-        response = httpx.post(
-            endpoint,
-            json=dict(payload),
-            headers={
-                "Authorization": f"Bearer {self.auth_key}",
-                "Content-Type": "application/json",
-            },
-            timeout=self.timeout,
-        )
+        from costkey.patch import internal_http
+        with internal_http():
+            response = httpx.post(
+                endpoint,
+                json=dict(payload),
+                headers={
+                    "Authorization": f"Bearer {self.auth_key}",
+                    "Content-Type": "application/json",
+                },
+                timeout=self.timeout,
+            )
         try:
             body = response.json()
         except Exception:

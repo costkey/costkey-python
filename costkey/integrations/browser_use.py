@@ -39,7 +39,8 @@ def step_hooks(name: str = "step") -> tuple[StepHook, StepHook]:
 
     async def on_step_start(agent: Any) -> None:
         number = _step_number(agent)
-        scope = _SpanScope(name, "step", attributes={"step": number} if number is not None else None)
+        scope = _SpanScope(name, "step", attributes={"step": number} if number is not None else None,
+                           framework="browser_use")
         try:
             scope.__enter__()
         except Exception:

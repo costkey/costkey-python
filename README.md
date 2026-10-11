@@ -4,10 +4,10 @@
 [![CI](https://github.com/costkey/costkey-python/actions/workflows/ci.yml/badge.svg)](https://github.com/costkey/costkey-python/actions/workflows/ci.yml)
 [![MIT](https://img.shields.io/badge/license-MIT-black.svg)](LICENSE)
 
-AI cost observability for Python. CostKey tracks supported provider calls'
-cost, tokens, latency, prompts, tool calls, and code location without adding a
-provider-routing hop. Endpoint coverage is explicit; framework-native
-components use `record_usage` when HTTP capture does not apply.
+AI cost observability for Python. The SDK captures raw telemetry from AI
+provider calls and agent frameworks, in process and without a provider-routing
+hop, and sends it to CostKey. The CostKey server does everything else: provider
+and model detection, usage extraction, pricing, deduplication and scoring.
 
 ```bash
 pipx run costkey setup
@@ -17,15 +17,14 @@ Your provider dashboard says you spent $2,000. CostKey tells you `generate_summa
 
 ## Why CostKey
 
-Most AI observability tools make you route traffic through a proxy or wrap every provider client. CostKey instruments supported `httpx`, `requests`, `aiohttp` and boto3/botocore Bedrock calls in-process, detects configured AI provider endpoints, captures useful metadata, and ships events asynchronously to the CostKey dashboard.
+Most AI observability tools make you route traffic through a proxy or wrap every provider client. CostKey instruments `httpx`, `requests`, `aiohttp` and boto3/botocore Bedrock calls in-process, recognizes AI provider hosts, and ships what it saw asynchronously to the CostKey server.
 
 - **No extra provider-routing hop** - provider traffic stays on its existing path; CostKey adds local interception and asynchronous telemetry. Explicit enforcement performs a separate admission decision.
 - **No provider-client wrappers** - keep using OpenAI, Anthropic, Gemini, LangChain, LiteLLM, or your own gateway.
-- **Code attribution** - see function, file, line, release, and stack trace for expensive calls.
-- **Prompt and tool visibility** - inspect system prompts, messages, tool definitions, tool calls, tool results, citations, and provider metadata.
-- **Trace grouping** - group calls from the same user action, request, or agent run.
-- **Call graph analysis** - the SDK scans your project structure so the dashboard highlights business logic, not thin wrappers.
-- **Privacy controls** - credentials are scrubbed and `before_send` can redact or drop events.
+- **Telemetry only** - the SDK never prices, counts tokens or characters, guesses models, merges stream usage or classifies errors. It sends a content-free skeleton of each request and response; the server computes the rest, so pricing and provider fixes ship without an SDK upgrade.
+- **Code attribution** - every call carries its raw stack, so the dashboard shows `generate_summary()` in `app/search.py:47`.
+- **Agent frameworks** - spans for OpenAI Agents, LangChain/LangGraph, CrewAI, LlamaIndex, Pydantic AI, Google ADK, Claude Agent SDK, smolagents, AutoGen, AG2, DSPy, Strands and any OpenTelemetry tracer.
+- **Privacy controls** - prompt and response text never leave the process unless the project enables body capture; credentials are scrubbed from URLs and headers, and `before_send` can redact or drop events.
 
 ## Quick Start
 
@@ -71,30 +70,35 @@ The bootstrap reads:
 
 ## What Shows Up
 
-Captured provider events can include:
+Every captured provider call carries `telemetry` (raw telemetry contract v1):
 
-| Data | Example |
+| Field | Contents |
 | --- | --- |
-| Cost | `$0.0184` for a single model call |
-| Usage | input, output, cache, reasoning, total tokens |
-| Latency | total duration, TTFT, tokens/sec for streams |
-| Code location | `app/search.py:47 generate_summary()` |
-| Trace | `POST /api/search`, `agent:research-summary` |
-| Prompt metadata | system/developer prompt, user messages, response text |
-| Tool metadata | tool definitions, tool choice, tool calls, tool results |
-| Provider metadata | citations, web search usage, raw provider fields |
-| Release | deploy SHA or version for cost-per-deploy |
+| `request` | method, URL (credential query parameters removed), allowlisted headers (`content-type`, `anthropic-version`, `anthropic-beta`, `openai-beta`, `x-goog-api-client`, `x-stainless-lang`), body skeleton, byte count |
+| `response` | status, headers (cookies, auth and secret token headers removed), body skeleton, byte count |
+| `stream` | `sse` / `ndjson` / `json-array` / `aws-eventstream` chunk skeletons (first 200, or first 20 + last 50), real `chunkCount`, `firstChunkMs`, `lastChunkMs` |
+| `error` | the raw exception class name (and errno name), never the message |
+| `startedAt`, `durationMs` | timing |
+
+A skeleton keeps the shape of a body and its numbers, and replaces text with
+its length: `{"role": "user", "content": "hello"}` becomes
+`{"role": {"$s": 4}, "content": {"$s": 5}}`. Strings are kept only under keys
+such as `model`, `id`, `type`, `status`, `finish_reason` and `service_tier`
+(200 characters at most). Arrays over 32 items keep 8 and a `{"$more": n}`
+count (embedding vectors never ship), binary bodies become `{"$bytes": n}`,
+uploads become `{"$multipart": [...]}`, depth is capped at 12 and each
+skeleton at 64 KB. Calls also carry trace, span, context, release and the
+call stack. The server derives provider, model, tokens, cost, latency and
+TTFT from this.
 
 ## Frameworks
 
-`costkey setup` detects and guides setup for:
+`costkey setup` detects and guides setup for FastAPI, Django, Flask and plain
+Python scripts and services.
 
-- FastAPI
-- Django
-- Flask
-- plain Python scripts and services
-
-CostKey works with provider clients that use `httpx`, `requests` or `aiohttp` under the hood, and with boto3/botocore `bedrock-runtime` clients.
+CostKey captures provider clients that use `httpx`, `requests` or `aiohttp`
+under the hood, and boto3/botocore `bedrock-runtime` clients. Agent framework
+integrations are listed under [Agents](#agents).
 
 ## Traces and Context
 
@@ -130,19 +134,148 @@ with costkey.agent("dash", user_id=user.id) as span:
         holdings = get_holdings(user.id)
 ```
 
-Framework hooks:
+### Framework integrations
+
+Each integration is an optional extra (`pip install "costkey[langchain]"`)
+imported only from `costkey.integrations.<name>`; `import costkey` never
+imports a framework. Integrations create spans with the framework's raw
+attributes under `attributes.<framework>` (a skeleton unless body capture is
+on). They never emit call events for in-process model calls, which the HTTP
+capture already records; the Claude Agent SDK is the exception, because its
+model calls run in a separate Claude Code process.
+
+| Framework | Extra | What becomes a span |
+| --- | --- | --- |
+| OpenAI Agents SDK | `openai-agents` | traces, agents, turns, tools, handoffs, guardrails |
+| LangChain / LangGraph | `langchain` / `langgraph` | chains, graph nodes, tools, retrievers, agents |
+| CrewAI | `crewai` | crews, flows, agents, tasks, tools, memory and knowledge queries |
+| LlamaIndex | `llama-index` | agents, workflows and steps, retrievers, tools, query and chat engines |
+| Pydantic AI | `pydantic-ai` | agent runs, tool executions |
+| Google ADK | `google-adk` | runner invocations, agents, tools |
+| Claude Agent SDK | `claude-agent-sdk` | sessions, subagents, tool uses, plus usage call events |
+| smolagents | `smolagents` | agent runs, action and planning steps |
+| AutoGen AgentChat | `autogen` | `invoke_agent`, `execute_tool`, `create_agent` (via OpenTelemetry) |
+| AG2 | `ag2` | agent turns, tool executions |
+| DSPy | `dspy` | modules, ReAct agents, tools, evaluations, compiles |
+| Strands Agents | `strands` | invocations, tools, multi-agent nodes |
+| Any OpenTelemetry tracer | `opentelemetry` | every span, with raw OTel attributes |
 
 ```py
-# OpenAI Agents SDK
-from costkey.integrations.openai_agents import CostKeyRunHooks
-result = await Runner.run(agent, user_input, hooks=CostKeyRunHooks())
+# OpenAI Agents SDK: a tracing processor covers every run
+from costkey.integrations.openai_agents import instrument
+instrument()
+result = await Runner.run(agent, "What's the weather in SF?")
+# or, with tracing disabled: Runner.run(agent, input, hooks=CostKeyRunHooks())
+```
 
+```py
+# LangChain / LangGraph
+from costkey.integrations.langchain import CostKeyCallbackHandler
+result = graph.invoke(inputs, config={"callbacks": [CostKeyCallbackHandler()]})
+```
+
+```py
+# CrewAI
+from costkey.integrations.crewai import CostKeyCrewAIListener
+listener = CostKeyCrewAIListener()  # registers on crewai_event_bus
+crew.kickoff()
+```
+
+```py
+# LlamaIndex
+from costkey.integrations.llama_index import instrument
+instrument()  # adds a span handler to the root dispatcher
+response = index.as_query_engine().query("What changed?")
+```
+
+```py
+# Pydantic AI
+from costkey.integrations.pydantic_ai import CostKeyCapability
+agent = Agent("openai:gpt-5", capabilities=[CostKeyCapability()])
+result = await agent.run("Summarize the incident")
+```
+
+```py
+# Google ADK
+from costkey.integrations.google_adk import CostKeyPlugin
+runner = InMemoryRunner(agent=root_agent, app_name="app", plugins=[CostKeyPlugin()])
+```
+
+```py
+# Claude Agent SDK
+from costkey.integrations.claude_agent_sdk import instrument
+claude = instrument()
+options = claude.with_hooks(ClaudeAgentOptions(model="claude-sonnet-4-5"))
+async for message in query(prompt="Fix the failing test", options=options):
+    ...
+```
+
+```py
+# smolagents
+from costkey.integrations.smolagents import instrument
+agent = instrument(CodeAgent(tools=[...], model=model))
+agent.run("task")
+```
+
+```py
+# AutoGen AgentChat (traces through OpenTelemetry)
+from costkey.integrations.autogen import instrument
+instrument()
+result = await AssistantAgent("assistant", model_client=client).run(task="...")
+```
+
+```py
+# AG2
+from costkey.integrations.ag2 import costkey_middleware
+agent = Agent("researcher", config=config, middleware=[costkey_middleware("researcher")])
+```
+
+```py
+# DSPy
+from costkey.integrations.dspy import CostKeyCallback
+dspy.configure(lm=dspy.LM("openai/gpt-4o-mini"), callbacks=[CostKeyCallback()])
+```
+
+```py
+# Strands Agents
+from costkey.integrations.strands import CostKeyHooks
+agent = Agent(model=model, tools=[...], hooks=[CostKeyHooks()])
+```
+
+```py
+# Any OpenTelemetry tracer (OpenLLMetry, OpenInference, your own spans)
+from costkey.integrations.opentelemetry import instrument
+instrument()  # adds CostKeySpanProcessor to the global SDK TracerProvider
+```
+
+```py
 # browser-use
 from costkey.integrations.browser_use import step_hooks
 on_step_start, on_step_end = step_hooks()
 with costkey.agent("browser-agent"):
     await browser_agent.run(on_step_start=on_step_start, on_step_end=on_step_end)
 ```
+
+Notes:
+
+- **OpenAI Agents SDK.** Use the tracing processor *or* the hooks, not both.
+  The SDK runs hooks in child tasks, so with hooks the span tree is recorded
+  but model calls attach to the span around `Runner.run`. The processor needs
+  the Agents SDK's tracing enabled. Its own trace exporter
+  (`/v1/traces/ingest`) is never captured as a model call.
+- **Claude Agent SDK.** Each message that carries usage (`usage` or
+  `modelUsage` on the message, `message`, `event` or `event.message`) is sent
+  as a call event with `telemetry.source = "claude-agent-sdk"` and the raw
+  message skeleton in `telemetry.response.body`. `instrument()` reads the raw
+  CLI messages by wrapping the SDK's internal `Query.receive_messages`.
+- **DSPy 3.4** sends model requests through its vendored `lm15` HTTP client
+  (raw sockets). `CostKeyCallback` also patches that transport so those calls
+  produce the same raw telemetry.
+- **smolagents** reports steps only after they finish, so steps are sent as
+  completed spans with the step's own timing; model calls sit under the agent
+  span and the server places them in steps by time.
+- **CrewAI** handlers run on a thread pool; span ids derive from CrewAI's
+  event ids, so the tree is right even when handlers run out of order.
 
 See [Agents and tools](https://costkey.dev/docs/agents).
 
@@ -165,9 +298,13 @@ with costkey.start_execution(
         import_document(42)
 ```
 
-Adapters for components that are not observed through supported HTTP clients
-report a caller-owned identity and monotonic revision. Cumulative snapshots
-replace the prior snapshot; they are not summed:
+Components that are not observed through supported HTTP clients can report
+usage explicitly. The SDK sends exactly what you pass: it fills in no
+defaults (charge id, currency, amount kind) and derives nothing. Deduplication,
+revision fences and pricing happen on the server, which requires an
+`event_id`, a `component_id` and a non-negative integer `revision`.
+Cumulative snapshots replace the prior snapshot on the server; they are not
+summed:
 
 ```py
 costkey.record_usage(
@@ -181,42 +318,28 @@ costkey.record_usage(
 )
 ```
 
-For a verified LiveKit `session_usage_updated` callback, use
-`costkey.livekit.record_livekit_usage(update, session_id=..., revision=...)`.
-This reports the observed STT/LLM/TTS components under one session; it does
-not intercept arbitrary voice traffic, and omitted components remain partial.
+For LiveKit Agents, send each `session_usage_updated` snapshot as it is. The
+SDK sends the raw update as a skeleton (numbers, `provider`, `model` and
+`type` kept); the server classifies the STT/LLM/TTS rows and sums them.
 
 ```py
 from costkey.livekit import record_livekit_usage
 
 @session.on("session_usage_updated")
 def on_usage(ev):
-    # ev.usage.model_usage is a cumulative list of typed provider/model rows.
     record_livekit_usage(
         ev,
         session_id=session.room.name,
-        revision=next_revision(),  # supplied by the application adapter
-        expected_components=("stt", "llm", "tts"),
+        revision=next_revision(),  # monotonic, supplied by the application
+        exclude_components=("llm",),  # optional: forwarded to the server
     )
 ```
 
-The adapter preserves Python's native duration unit (seconds), token fields,
-characters and provider/model identity. It does not treat a final session
-report as a second charge for the same revision.
-
-LiveKit's usage classes do not include provider prices. Supply
-`declared_amounts`/`declared_pricing_ids` when the application has an explicit
-rate basis; these amounts are marked estimated and are never inferred from
-duration or token counts.
-
-When HTTP auto-capture already records the underlying LLM requests, use
-`exclude_components={"llm"}` so the session aggregate does not double-count
-them; session totals and individual request IDs are different granularities.
-If the same LLM provider request is also auto-captured, make the session
-snapshot the source of charge for that scoped request with
-`with costkey.with_context(costkeyCapture="manual"):` so it is not counted at
-both HTTP and session granularity. Only use this when the integration has
-verified that the session snapshot covers that request.
+`expected_components`, `exclude_components`, `declared_amounts`,
+`declared_pricing_ids` and `declared_billing_units` are forwarded verbatim in
+`telemetry.livekit` for the server to apply. If the same LLM request is also
+auto-captured and the session snapshot should own its charge, scope it with
+`with costkey.with_context(costkeyCapture="manual"):`.
 
 To cross a trusted service or queue boundary, explicitly attach the
 allowlisted carrier returned by `costkey.export_context()` (or its JSON header
@@ -226,15 +349,13 @@ outbound URLs.
 
 ## Streaming
 
-Streaming responses are fully supported. The SDK records the bytes your code
-reads from `httpx`, `requests` and `aiohttp` streams (and the events of boto3
-Bedrock streams) without buffering ahead of you, and captures:
-
-- TTFT, time to first token
-- output tokens per second
-- stream duration
-- usage merged across SSE chunks, Gemini JSON streams and AWS event streams
-  (Bedrock `converse-stream` / `invoke-with-response-stream`)
+The SDK records the bytes your code reads from `httpx`, `requests` and
+`aiohttp` streams (and the events of boto3 Bedrock streams) without buffering
+ahead of you. Each stream is sent as chunk skeletons (`sse`, `ndjson`,
+`json-array` or decoded `aws-eventstream` frames) with the chunk count and the
+times of the first and last network reads; the server derives TTFT, tokens per
+second and usage. SSE `event:` lines and the `[DONE]` sentinel are framing and
+are not sent.
 
 A stream your code stops reading early is reported when the response is
 closed or released. Non-AI HTTP calls pass through untouched.
@@ -247,7 +368,9 @@ then removes those headers before the provider request. Body and prompt
 capture starts metadata-only until the project runtime config confirms text
 capture; an explicit `capture_body=False` always wins. The DSN config is
 refreshed periodically (customize with `config_refresh_interval`) so a remote
-revocation returns future calls to metadata-only capture.
+revocation returns future calls to metadata-only capture. In metadata-only
+mode a call ships only its telemetry skeleton: text becomes its length, and
+framework span attributes and OpenTelemetry attributes are skeletons too.
 
 Redact before anything leaves your process:
 
@@ -271,69 +394,18 @@ costkey.init(
 
 ## Providers
 
-Built-in detection covers:
+Calls to these hosts are captured:
 
-- **Model APIs:** OpenAI (including audio), Azure OpenAI, Anthropic, Google Gemini, Google Vertex AI (Gemini and partner models such as Claude, Llama and Mistral), AWS Bedrock, xAI, Mistral, DeepSeek, Cohere, AI21, Upstage, Sarvam, and TypeSafe.
-- **OpenAI-compatible hosts:** Groq, Together, Fireworks, Perplexity, Cerebras, OpenRouter, DeepInfra, NVIDIA NIM, SambaNova, Novita, Hyperbolic, Nebius, Alibaba Cloud Model Studio (DashScope), Moonshot (Kimi), Z.ai (GLM), MiniMax, Hugging Face Inference Providers, Baseten, Lambda, Featherless, Friendli, Cloudflare Workers AI, Vercel AI Gateway, and a local Ollama server (port 11434). Gateways such as Portkey and Helicone are detected too.
-- **Speech:** ElevenLabs, Deepgram, AssemblyAI, Cartesia, Rumik, Sarvam, MiniMax and OpenAI speech/transcription.
+- **Model APIs:** OpenAI (including audio), Azure OpenAI, Anthropic, Google Gemini, Google Vertex AI, AWS Bedrock (HTTP and boto3), xAI, Mistral, DeepSeek, Cohere, AI21, Upstage, Sarvam, TypeSafe and Rumik.
+- **OpenAI-compatible hosts:** Groq, Together, Fireworks, Perplexity, Cerebras, OpenRouter, DeepInfra, NVIDIA NIM, SambaNova, Novita, Hyperbolic, Nebius, Alibaba Cloud Model Studio (DashScope), Moonshot (Kimi), Z.ai (GLM), MiniMax, Hugging Face Inference Providers, Baseten, Lambda, Featherless, Friendli, Cloudflare Workers AI, Vercel AI Gateway, and a local Ollama server (port 11434). Gateways (Portkey, Helicone) are captured under their own label.
+- **Speech:** ElevenLabs, Deepgram, AssemblyAI, Cartesia and OpenAI speech/transcription.
 - **Embeddings, rerank and search:** Voyage AI, Jina AI, Cohere, Exa, Tavily and Firecrawl.
 
-Each call is reported with a provider id and model; CostKey prices it on the
-server from token usage and `usage.nativeUnits`. Text-to-speech is counted
-from the request text (or the provider's character header), never from the
-audio, and audio responses are not buffered.
-
-Calls that are not billed per token report provider-native units in
-`usage.nativeUnits`, and provider-reported amounts in `usage.costUsd`:
-
-| Provider | Units |
-| --- | --- |
-| Gemini / Vertex grounding | `searchQueries` (distinct executed queries), `groundingRequests`, `mapsGroundingRequests` |
-| ElevenLabs text-to-speech | `characters` (the `character-cost` header when present, else the request text) |
-| ElevenLabs speech-to-text | `audioSeconds` |
-| Rumik | `characters` |
-| Exa | `searchQueries` and `searchResults` (search, find-similar), `pages` (contents), `costUsd` from `costDollars.total` |
-| Firecrawl | `credits` (reported `creditsUsed`; scrape and map default to 1), `searchQueries`/`searchResults` for search |
-| OpenAI / Azure `audio/speech` | `characters` of the request `input` |
-| OpenAI / Azure `audio/transcriptions`, `audio/translations` | `audioSeconds` (duration usage or verbose_json `duration`), or tokens for token-billed models |
-| Deepgram | `audioSeconds` for `/v1/listen` (model from the `model` query, default `nova-3`), `characters` for `/v1/speak` |
-| AssemblyAI | `audioSeconds` on the `GET /v2/transcript/{id}` that reports `completed` |
-| Cartesia | `characters` of the request `transcript` |
-| MiniMax T2A (`/v1/t2a_v2`) | `characters` of the request `text` |
-| Sarvam | `characters` for text-to-speech (default `bulbul:v2`), `audioSeconds` for speech-to-text when reported (default `saarika:v2.5`) |
-| Cohere rerank | `searchQueries` from `billed_units.search_units` |
-| Tavily | `searchQueries` for search (model `search` or `search-advanced`), `credits` when the request sets `include_usage` |
-
-Firecrawl job status polls (`/v2/crawl/{id}` and similar) are recorded without
-credits, since each poll repeats the job's running total.
-
-Voyage and Jina embeddings and rerank report their `usage.total_tokens` as
-input tokens. Native Ollama calls (`/api/chat`, `/api/generate`) report
-`prompt_eval_count`/`eval_count` as input/output tokens, streamed or not.
-
-Add your own provider or internal gateway:
-
-```py
-from costkey.providers import ProviderExtractor, NormalizedUsage
-
-class InternalGatewayExtractor:
-    provider = "internal"
-
-    def match(self, url: str) -> bool:
-        return "llm.internal.example.com" in url
-
-    def extract_usage(self, body) -> NormalizedUsage | None:
-        usage = body.get("usage") if isinstance(body, dict) else None
-        if not usage:
-            return None
-        return NormalizedUsage(
-            input_tokens=usage.get("input_tokens"),
-            output_tokens=usage.get("output_tokens"),
-            total_tokens=usage.get("total_tokens"),
-        )
-
-costkey.register_extractor(InternalGatewayExtractor())
-```
+Which provider, model, tokens, native units (characters, audio seconds,
+search queries, credits) and cost a call represents is decided on the server
+from its raw telemetry. Custom hosts and internal gateways are configured in
+the CostKey project; the SDK picks the hostnames up from the DSN runtime
+config and captures them like any other provider.
 
 ## API
 
@@ -347,18 +419,36 @@ costkey.register_extractor(InternalGatewayExtractor())
 | `costkey.span(name, kind=..., **options)` | A span of any kind |
 | `costkey.start_trace(name=None, trace_id=None)` | Group calls into one trace |
 | `costkey.start_execution(name, kind="batch", execution_id=None)` | Group repeatable work with a fresh invocation ID |
-| `costkey.record_usage(...)` | Report deduplicated external/native usage with delta or cumulative semantics |
+| `costkey.record_usage(...)` | Report external usage exactly as passed (delta or cumulative) |
+| `costkey.record_livekit_usage(update, ...)` | Send a raw LiveKit usage snapshot |
 | `costkey.export_context()` | Export an explicit allowlisted carrier for trusted handoff |
 | `costkey.export_context_headers()` | Encode that carrier for an explicitly trusted request |
 | `costkey.get_runtime_config_status()` | Inspect metadata-safe runtime capture config state |
-| `costkey.register_extractor(extractor)` | Add custom provider detection |
-| `costkey.register_pricing(model, pricing)` | Add custom model pricing |
+
+## Upgrading from 0.6
+
+0.7.0 makes the SDK telemetry-only. Breaking changes:
+
+- `costkey.score()` is removed. Quality checks run on the server.
+- `costkey.register_pricing()` and `costkey.pricing` are removed. Pricing is server-side.
+- `costkey.register_extractor()`, the provider extractor classes, `NormalizedUsage` and `StreamTiming` are removed. Custom providers are server configuration.
+- Call events no longer carry SDK-computed `model`, `usage`, `costUsd`, `streamTiming`, `requestModel`, `providerRequestId`, `chargeId`, `systemPrompt` or `metadata`; they carry `telemetry` instead.
+- Call events are now also sent when the provider call raises (`telemetry.error`, `response` null).
+- `record_usage` no longer deduplicates, fences revisions, rejects negative or non-numeric units, or fills in `chargeId`, `currency`, `amountKind`, `unitKind` or `costUsd`.
+- `record_livekit_usage` sends one raw event per snapshot instead of per-component usage events.
+- Stack frames are sent unfiltered; the call graph upload sends raw functions, callees and call expressions instead of scores.
+- Span and lifecycle errors send the raw exception class name (`errorName`, plus `errorType`); `CancelledError` is no longer mapped to `cancelled` in the SDK.
+- Admission (`/admit`) receives the request skeleton as `request` instead of `model` and `usageBounds`; settlement always reports `outcome: "unknown"` with the call's `eventId`.
+- Framework integration span attributes move under `attributes.<framework>`.
 
 ## Development
 
 ```bash
 python -m pip install -e ".[test]" build twine
 python -m pytest
+# Framework integration tests skip frameworks that are not installed. CrewAI
+# and DSPy pin openai<3, which conflicts with openai-agents, so run their
+# tests from a second environment with those two installed.
 python -m build
 python -m twine check dist/*
 ```
@@ -367,7 +457,7 @@ python -m twine check dist/*
 
 Publishing is done from GitHub Releases only.
 
-1. Update `pyproject.toml` and `costkey/__init__.py` versions.
+1. Update the versions in `pyproject.toml` and `costkey/version.py`.
 2. Merge to `main`.
 3. Create a GitHub Release tagged `vX.Y.Z`.
 4. GitHub Actions runs tests, builds, verifies the tag matches the package version, and publishes to PyPI.

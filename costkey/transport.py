@@ -4,7 +4,6 @@ Enqueue is non-blocking; explicit flush/shutdown may wait for best-effort
 delivery at an application-owned lifecycle boundary.
 """
 from __future__ import annotations
-import json
 import time
 import threading
 import logging
@@ -172,15 +171,17 @@ class Transport:
             payload["release"] = self._release
 
         try:
-            resp = httpx.post(
-                self._endpoint,
-                json=payload,
-                headers={
-                    "Authorization": f"Bearer {self._auth_key}",
-                    "User-Agent": f"costkey-python/{__version__}",
-                },
-                timeout=10,
-            )
+            from costkey.patch import internal_http
+            with internal_http():
+                resp = httpx.post(
+                    self._endpoint,
+                    json=payload,
+                    headers={
+                        "Authorization": f"Bearer {self._auth_key}",
+                        "User-Agent": f"costkey-python/{__version__}",
+                    },
+                    timeout=10,
+                )
             if resp.status_code in (401, 403):
                 # Auth failure — always log (not just debug)
                 logger.warning(f"[costkey] Authentication failed ({resp.status_code}). Check the DSN under Settings, Projects in your CostKey console")
@@ -260,12 +261,7 @@ class Transport:
             "costUsd": event.cost_usd,
             "durationMs": event.duration_ms,
             "streaming": event.streaming,
-            "streamTiming": {
-                "ttft": event.stream_timing.ttft,
-                "tps": event.stream_timing.tps,
-                "streamDuration": event.stream_timing.stream_duration,
-                "chunkCount": event.stream_timing.chunk_count,
-            } if event.stream_timing else None,
+            "streamTiming": None,
             "callSite": {
                 "raw": event.call_site.raw,
                 "frames": [
@@ -276,22 +272,12 @@ class Transport:
             } if event.call_site else None,
             "context": event.context,
             "metadata": event.metadata,
-            "systemPrompt": event.system_prompt,
+            "systemPrompt": None,
             "requestBody": event.request_body,
             "responseBody": event.response_body,
         }
-        if event.usage:
-            d["usage"] = {
-                "inputTokens": event.usage.input_tokens,
-                "outputTokens": event.usage.output_tokens,
-                "totalTokens": event.usage.total_tokens,
-                "reasoningTokens": event.usage.reasoning_tokens,
-                "cacheReadTokens": event.usage.cache_read_tokens,
-                "cacheCreationTokens": event.usage.cache_creation_tokens,
-                "nativeUnits": event.usage.native_units,
-                "costUsd": event.usage.cost_usd,
-                "imageOutputTokens": event.usage.image_output_tokens,
-            }
+        if event.telemetry is not None:
+            d["telemetry"] = event.telemetry
 
         # Promote standard identity fields so new servers can index them while
         # retaining the legacy context object used by older servers.
@@ -312,8 +298,6 @@ class Transport:
             if value is not None:
                 d[key] = value
 
-        if event.request_model is not None:
-            d["requestModel"] = event.request_model
         if event.provider_request_id is not None:
             d["providerRequestId"] = event.provider_request_id
         if event.attempt_id is not None:
@@ -330,13 +314,6 @@ class Transport:
                 d["parentSpanId"] = event.parent_span_id
             if event.attributes:
                 d["attributes"] = event.attributes
-        if event.event_type == "score":
-            d["name"] = event.score_name
-            d["value"] = event.score_value
-            if event.score_label is not None:
-                d["label"] = event.score_label
-            if event.score_comment is not None:
-                d["comment"] = event.score_comment
         if event.entity_type is not None:
             d["entityType"] = event.entity_type
         if event.entity_id is not None:
@@ -350,6 +327,9 @@ class Transport:
         if event.ended_at is not None:
             d["endedAt"] = event.ended_at
         if event.error_type is not None:
+            # Contract detail 7: the raw class name. ``errorType`` is the
+            # legacy alias older servers read.
+            d["errorName"] = event.error_type
             d["errorType"] = event.error_type
         if event.expected_items is not None:
             d["expectedItems"] = event.expected_items
