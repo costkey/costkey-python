@@ -781,21 +781,23 @@ class _SpanScope:
                 self._owns_trace = False
                 self._emit_trace("completed" if exc_type is None else "failed",
                                  None if exc_type is None else exc_type.__name__)
-            if self.detached:
-                return False
-            try:
-                _context.reset(self._token)
-            except ValueError:
-                # Closed from a different context (e.g. framework hooks): restore by value.
-                _context.set(self._previous or {})
-            if self._trace_cm is not None:
-                trace_cm, self._trace_cm = self._trace_cm, None
-                try:
-                    trace_cm.__exit__(exc_type, exc, tb)
-                except ValueError:
-                    # The trace scope was opened in another context.
-                    _context.set(self._previous or {})
+            if not self.detached:
+                self._restore_context(exc_type, exc, tb)
         return False
+
+    def _restore_context(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        try:
+            _context.reset(self._token)
+        except ValueError:
+            # Closed from a different context (e.g. framework hooks): restore by value.
+            _context.set(self._previous or {})
+        if self._trace_cm is not None:
+            trace_cm, self._trace_cm = self._trace_cm, None
+            try:
+                trace_cm.__exit__(exc_type, exc, tb)
+            except ValueError:
+                # The trace scope was opened in another context.
+                _context.set(self._previous or {})
 
     async def __aenter__(self) -> SpanHandle:
         return self.__enter__()
