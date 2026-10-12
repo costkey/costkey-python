@@ -18,6 +18,16 @@ from costkey.version import __version__
 logger = logging.getLogger("costkey")
 
 
+def _frame_dict(f: Any) -> dict[str, Any]:
+    d: dict[str, Any] = {"functionName": f.function_name, "fileName": f.file_name,
+                         "lineNumber": f.line_number, "columnNumber": None}
+    if getattr(f, "context_line", None) is not None:
+        d["contextLine"] = f.context_line
+        d["preContext"] = list(f.pre_context or [])
+        d["postContext"] = list(f.post_context or [])
+    return d
+
+
 def _sanitize_url(value: Any) -> str:
     """Defense-in-depth URL sanitization at the final telemetry boundary."""
     if not isinstance(value, str) or not value:
@@ -318,11 +328,7 @@ class Transport:
             "streamTiming": None,
             "callSite": {
                 "raw": event.call_site.raw,
-                "frames": [
-                    {"functionName": f.function_name, "fileName": f.file_name,
-                     "lineNumber": f.line_number, "columnNumber": None}
-                    for f in event.call_site.frames
-                ],
+                "frames": [_frame_dict(f) for f in event.call_site.frames],
             } if event.call_site else None,
             "context": event.context,
             "metadata": event.metadata,

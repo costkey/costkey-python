@@ -62,6 +62,10 @@ class StackFrame:
     function_name: str | None = None
     file_name: str | None = None
     line_number: int | None = None
+    # Source context, only for in-app frames whose file could be read.
+    context_line: str | None = None
+    pre_context: list[str] | None = None
+    post_context: list[str] | None = None
 
 
 @dataclass
