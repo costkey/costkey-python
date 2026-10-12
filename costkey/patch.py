@@ -1168,6 +1168,7 @@ class _StreamRecorder:
         self.settlement_async = settlement_async
         self.collector = _telemetry.StreamCollector(
             _telemetry.content_type(headers), start=call.start, content_length=_content_length(headers),
+            capture=call.capture_body,
         )
         # Client read methods call each other (iter_lines -> iter_text ->
         # iter_bytes); only the outermost one records.
@@ -1213,6 +1214,7 @@ class _StreamRecorder:
             self.call.finish(
                 status=self.status_code, headers=self.headers, body=body,
                 body_bytes=self.collector.bytes, stream=stream, error=self.error,
+                captured_response=self.collector.captured_body() if self.call.capture_body else None,
             )
         except Exception:
             logger.debug("[costkey] stream capture failed", exc_info=True)

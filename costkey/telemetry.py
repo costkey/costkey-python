@@ -533,15 +533,21 @@ def _event_stream_headers(raw: bytes) -> dict[str, Any]:
     return headers
 
 
+STREAM_BODY_KEY = "__costkey_stream__"
+
+
 class StreamCollector:
     """Turns a streamed response body into skeleton chunks, incrementally.
 
     Keeps the first 200 chunks and the last 50; at the end, over 200 chunks
     become the first 20 plus the last 50, and ``chunkCount`` keeps the total.
+
+    With ``capture`` (body capture on), every parsed event is also kept whole
+    and in order, for :meth:`captured_body`.
     """
 
     def __init__(self, kind: str = "", start: float | None = None,
-                 content_length: int | None = None) -> None:
+                 content_length: int | None = None, capture: bool = False) -> None:
         self.start = start if start is not None else time.perf_counter()
         kind = (kind or "").lower()
         if kind.startswith("text/event-stream"):
@@ -562,6 +568,10 @@ class StreamCollector:
         self.last_ms: float | None = None
         self._buffer = bytearray()
         self._data_lines: list[str] = []
+        self._event_name: str | None = None
+        # Content capture only: every event whole, uncapped.
+        self.events: list[Any] | None = [] if capture else None
+        self._whole_body: Any = None
 
     def _mark(self) -> None:
         now = (time.perf_counter() - self.start) * 1000
@@ -569,18 +579,23 @@ class StreamCollector:
             self.first_ms = round(now, 2)
         self.last_ms = round(now, 2)
 
-    def _add(self, payload: Any) -> None:
+    def _add(self, payload: Any, *, event: str | None = None, keep: bool = True) -> None:
         chunk = skeleton(payload)
         self.count += 1
         if len(self.head) < MAX_STREAM_CHUNKS:
             self.head.append(chunk)
         self.tail.append(chunk)
+        if keep and self.events is not None:
+            self.events.append({"event": event, "data": payload} if event else payload)
 
-    def _add_text(self, text: str) -> None:
+    def _add_text(self, text: str, event: str | None = None) -> None:
         try:
-            self._add(json.loads(text))
+            parsed = json.loads(text)
         except ValueError:
-            self._add(text)
+            # Non-JSON data is counted in the skeleton but is not an event.
+            self._add(text, keep=False)
+            return
+        self._add(parsed, event=event)
 
     def feed(self, data: Any) -> None:
         if not data:
@@ -621,14 +636,18 @@ class StreamCollector:
         elif line.startswith("data:"):
             value = line[5:]
             self._data_lines.append(value[1:] if value.startswith(" ") else value)
+        elif line.startswith("event:"):
+            value = line[6:]
+            self._event_name = value[1:] if value.startswith(" ") else value
 
     def _dispatch_sse(self) -> None:
+        name, self._event_name = self._event_name, None
         if self._data_lines:
             data = "\n".join(self._data_lines)
             self._data_lines = []
             # ``[DONE]`` is framing (the end-of-stream sentinel), not a record.
             if data.strip() != "[DONE]":
-                self._add_text(data)
+                self._add_text(data, name or None)
 
     def _ndjson_line(self, line: str) -> None:
         if line.strip():
@@ -653,7 +672,8 @@ class StreamCollector:
             try:
                 payload: Any = json.loads(payload_raw)
             except ValueError:
-                payload = {"$bytes": len(payload_raw)}
+                self._add(bedrock_event({str(name): {"$bytes": len(payload_raw)}}), keep=False)
+                continue
             self._add(bedrock_event({str(name): payload}))
 
     def finish(self) -> tuple[dict[str, Any] | None, Any]:
@@ -685,6 +705,7 @@ class StreamCollector:
                 for item in parsed:
                     self._add(item)
             elif parsed is not None:
+                self._whole_body = parsed
                 return None, skeleton(parsed)
             elif re.search(r"^data:", text, re.MULTILINE):
                 self.format = "sse"
@@ -708,6 +729,18 @@ class StreamCollector:
             "firstChunkMs": self.first_ms,
             "lastChunkMs": self.last_ms,
         }, None
+
+    def captured_body(self) -> Any:
+        """The response for content capture, after :meth:`finish`.
+
+        A stream is ``{"__costkey_stream__": [every event, in order]}``; a
+        body that turned out to be one JSON document is that document.
+        """
+        if self.events is None or self.binary:
+            return None
+        if self.format is None:
+            return self._whole_body
+        return {STREAM_BODY_KEY: self.events}
 
 
 def build(
