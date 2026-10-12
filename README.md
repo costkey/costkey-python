@@ -371,6 +371,10 @@ refreshed periodically (customize with `config_refresh_interval`) so a remote
 revocation returns future calls to metadata-only capture. In metadata-only
 mode a call ships only its telemetry skeleton: text becomes its length, and
 framework span attributes and OpenTelemetry attributes are skeletons too.
+With text capture on, prompts, responses, span input and output, and framework
+and OpenTelemetry attributes are sent whole, never truncated (secret-looking
+values are still redacted). Deliveries are split so one request stays near
+8 MB; a larger event goes alone.
 
 Redact before anything leaves your process:
 

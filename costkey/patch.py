@@ -79,7 +79,7 @@ _CARRIER_HEADERS = frozenset({_CONTEXT_HEADER, _TRACE_ID_HEADER, _TRACE_NAME_HEA
 _BLOB_MIN_CHARS = 16_384
 _BASE64_BLOB = re.compile(r"(?:data:[\w/+.-]+;base64,)?[A-Za-z0-9+/=_-]+")
 _MULTIPART_FIELD = re.compile(
-    rb'content-disposition: form-data; name="([^"]+)"\r\n(?:[^\r\n]+\r\n)*\r\n(.{0,4096}?)\r\n--',
+    rb'content-disposition: form-data; name="([^"]+)"\r\n(?:[^\r\n]+\r\n)*\r\n(.*?)\r\n--',
     re.IGNORECASE | re.DOTALL,
 )
 _STREAM_TYPES = ("text/event-stream", "application/x-ndjson", "application/vnd.amazon.eventstream")
@@ -2061,16 +2061,13 @@ def emit_lifecycle(
     return event_id
 
 
-_MAX_SPAN_PAYLOAD_CHARS = 2000
-
-
 def framework_attributes(framework: str, raw: dict[str, Any] | None) -> dict[str, Any]:
     """Span attributes for a framework integration: the framework's raw
-    attributes under ``attributes.<framework>``, raw when body capture is on
-    and as an attribute skeleton when it is off."""
+    attributes under ``attributes.<framework>``, whole (scrubbed) when body
+    capture is on and as an attribute skeleton when it is off."""
     values = dict(raw or {})
     nested = (
-        _telemetry.cap_size(_json_safe(_scrub(values)))
+        _json_safe(_scrub(values))
         if _state.capture_body
         else _telemetry.attribute_skeleton(values)
     )
@@ -2078,7 +2075,7 @@ def framework_attributes(framework: str, raw: dict[str, Any] | None) -> dict[str
 
 
 def _span_payload(value: Any) -> str | None:
-    """Span input/output are content: bounded, scrubbed, capture-only."""
+    """Span input/output are content: whole, scrubbed, capture-only."""
     if value is None:
         return None
     try:
@@ -2088,7 +2085,7 @@ def _span_payload(value: Any) -> str | None:
     text = _scrub(text)
     if not isinstance(text, str):
         return None
-    return text if len(text) <= _MAX_SPAN_PAYLOAD_CHARS else text[:_MAX_SPAN_PAYLOAD_CHARS] + "…"
+    return text
 
 
 def emit_span(

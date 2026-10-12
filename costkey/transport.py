@@ -4,6 +4,7 @@ Enqueue is non-blocking; explicit flush/shutdown may wait for best-effort
 delivery at an application-owned lifecycle boundary.
 """
 from __future__ import annotations
+import json
 import time
 import threading
 import logging
@@ -39,9 +40,36 @@ def _sanitize_url(value: Any) -> str:
         return ""
 
 MAX_QUEUE_SIZE = 500
+# Serialized JSON per POST. The ingest server accepts up to 32 MB (Cloud Run
+# caps HTTP/1 requests at 32 MiB); batches stay well under that. A single
+# event larger than this still goes, alone.
+MAX_BATCH_BYTES = 8 * 1024 * 1024
 MAX_RETRIES = 10
 BASE_BACKOFF_S = 2.0
 MAX_BACKOFF_S = 60.0
+
+
+def _encode(value: Any) -> bytes:
+    return json.dumps(value, separators=(",", ":"), ensure_ascii=False, default=str).encode("utf-8")
+
+
+def _event_bytes(event: dict[str, Any]) -> int:
+    try:
+        return len(_encode(event))
+    except Exception:
+        return 0
+
+
+def _fit_bytes(events: list[dict[str, Any]], limit: int) -> list[dict[str, Any]]:
+    """The longest prefix of ``events`` whose serialized size stays within
+    ``limit``; always at least one event, so an oversized event goes alone."""
+    total = 0
+    for index, event in enumerate(events):
+        # +1 for the comma between events in the array.
+        total += _event_bytes(event) + (1 if index else 0)
+        if index and total > limit:
+            return events[:index]
+    return events
 
 
 class Transport:
@@ -161,9 +189,18 @@ class Transport:
                         wait = round(self._backoff_until - now)
                         logger.warning(f"[costkey] Backing off, retry in {wait}s")
                     return None
-            batch = self._queue[:self._max_batch_size]
+            candidates = self._queue[:self._max_batch_size]
             self._queue = self._queue[self._max_batch_size:]
-            return batch
+        # Size the candidates outside the queue lock so a large body never
+        # blocks enqueue on a provider-call thread.
+        batch = _fit_bytes(candidates, MAX_BATCH_BYTES)
+        leftover = candidates[len(batch):]
+        if leftover:
+            with self._lock:
+                # Back at the front, in order; only the flush path takes, so
+                # nothing else was taken in between.
+                self._queue = (leftover + self._queue)[:MAX_QUEUE_SIZE]
+        return batch
 
     def _send_batch(self, batch: list[dict[str, Any]]) -> bool:
         payload: dict[str, Any] = {"sdkVersion": f"python-{__version__}", "events": batch}
@@ -171,16 +208,25 @@ class Transport:
             payload["release"] = self._release
 
         try:
+            body = _encode(payload)
+        except Exception as e:
+            # Unserializable events never succeed on retry; drop them.
+            logger.warning(f"[costkey] Dropped {len(batch)} events that could not be serialized: {e}")
+            return True
+
+        try:
             from costkey.patch import internal_http
             with internal_http():
                 resp = httpx.post(
                     self._endpoint,
-                    json=payload,
+                    content=body,
                     headers={
                         "Authorization": f"Bearer {self._auth_key}",
                         "User-Agent": f"costkey-python/{__version__}",
+                        "Content-Type": "application/json",
                     },
-                    timeout=10,
+                    # Large captured bodies take longer to upload.
+                    timeout=httpx.Timeout(10, write=max(10.0, len(body) / (256 * 1024))),
                 )
             if resp.status_code in (401, 403):
                 # Auth failure — always log (not just debug)

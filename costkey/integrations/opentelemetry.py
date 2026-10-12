@@ -34,13 +34,13 @@ from costkey.patch import _state, register_span_resolver, unregister_span_resolv
 
 FRAMEWORK = "opentelemetry"
 def otel_attributes(attributes: Mapping[str, Any] | None, *, capture: bool) -> Any:
-    """The span's raw OTel attributes: raw when body capture is on, otherwise
+    """The span's raw OTel attributes: whole when body capture is on, otherwise
     an attribute skeleton (a dotted key keeps its string only when its last
     segment is a keep key, so ``gen_ai.request.model`` survives and
     ``gen_ai.prompt`` does not)."""
     values = {str(key): value for key, value in (attributes or {}).items()}
     if capture:
-        return _telemetry.cap_size(_json_ready(values))
+        return _json_ready(values)
     return _telemetry.attribute_skeleton(values)
 
 
