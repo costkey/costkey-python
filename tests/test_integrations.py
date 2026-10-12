@@ -94,6 +94,47 @@ def test_openai_agents_tracing_processor():
     assert agent_span.attributes["openai_agents"]["type"] == "agent"
 
 
+def test_openai_agents_processor_merges_into_an_enclosing_agent():
+    agents = pytest.importorskip("agents")
+    import costkey
+    from costkey.integrations.openai_agents import CostKeyTracingProcessor
+
+    agent = _weather_agent()
+    agents.set_trace_processors([CostKeyTracingProcessor()])
+    try:
+        with capturing() as sink:
+            async def run():
+                with costkey.agent("weather"):
+                    return await agents.Runner.run(agent, "weather in SF?")
+            result = asyncio.run(run())
+    finally:
+        agents.set_trace_processors([])
+    assert result.final_output == "Sunny"
+    spans, calls = tree(sink)
+    names = [name for name, _status, _parent in spans]
+    # No "Agent workflow" span and no second "weather" agent inside the first.
+    assert names.count("agent:weather") == 1
+    assert not any(name.startswith("workflow:") for name in names)
+    assert ("step:turn 1", "ok", "agent:weather") in spans
+    assert ("tool:get_weather", "ok", "step:turn 1") in spans
+    assert calls == [("openai", "step:turn 1"), ("tavily", "tool:get_weather"), ("openai", "step:turn 2")]
+
+
+def test_instrument_exclusive_replaces_the_openai_exporter():
+    agents = pytest.importorskip("agents")
+    from costkey.integrations import openai_agents as integration
+
+    integration._installed = None
+    try:
+        processor = integration.instrument(exclusive=True)
+        provider = agents.tracing.get_trace_provider()
+        processors = list(getattr(provider, "_multi_processor", provider)._processors)
+        assert processors == [processor]
+    finally:
+        agents.set_trace_processors([])
+        integration._installed = None
+
+
 def test_openai_agents_run_hooks():
     agents = pytest.importorskip("agents")
     from costkey.integrations.openai_agents import CostKeyRunHooks

@@ -187,21 +187,44 @@ def _span_attributes(span: Any, data: Any, span_type: str) -> dict[str, Any]:
     return {key: value for key, value in attributes.items() if value is None or isinstance(value, (str, int, float, bool))}
 
 
+def _enclosing() -> dict[str, Any]:
+    """The CostKey context around the run: its span and the agent it is inside."""
+    try:
+        from costkey import client
+        return dict(client.get_context())
+    except Exception:
+        return {}
+
+
 class CostKeyTracingProcessor(_TracingProcessorBase):  # type: ignore[misc,valid-type]
-    """An ``agents`` TracingProcessor that turns traces and spans into CostKey spans."""
+    """An ``agents`` TracingProcessor that turns traces and spans into CostKey spans.
+
+    Inside an existing CostKey span (``costkey.agent("dash")`` around
+    ``Runner.run``) the SDK's trace adds no span of its own, and an SDK agent
+    named like the enclosing CostKey agent merges into it, so the run reads
+    dash > tools and calls, not dash > Agent workflow > dash.
+    """
 
     def __init__(self) -> None:
         self._tracker = SpanTracker(FRAMEWORK)
 
     def on_trace_start(self, trace: Any) -> None:
         trace_id = getattr(trace, "trace_id", None)
+        if _enclosing().get("spanId"):
+            # Children nest under the enclosing CostKey span through context.
+            self._tracker.skip(("trace", trace_id), None)
+            return
         self._tracker.start(
             ("trace", trace_id), _name(trace, "workflow"), "workflow",
             attributes={"trace_id": trace_id},
         )
 
     def on_trace_end(self, trace: Any) -> None:
-        self._tracker.end(("trace", getattr(trace, "trace_id", None)))
+        key = ("trace", getattr(trace, "trace_id", None))
+        if not self._tracker.is_open(key):
+            self._tracker.forget(key)
+            return
+        self._tracker.end(key)
 
     def on_span_start(self, span: Any) -> None:
         span_type = _span_type(span)
@@ -212,6 +235,15 @@ class CostKeyTracingProcessor(_TracingProcessorBase):  # type: ignore[misc,valid
             self._tracker.skip(key, parent)
             return
         data = getattr(span, "span_data", None)
+        if self._tracker.span_id(parent) is None:
+            enclosing = _enclosing()
+            # The run's own wrapper span (newer SDKs open a "task" per run).
+            if span_type == "task" and enclosing.get("spanId"):
+                self._tracker.skip(key, parent)
+                return
+            if span_type == "agent" and enclosing.get("agent") and enclosing.get("agent") == _span_name(data, span_type):
+                self._tracker.skip(key, parent)
+                return
         self._tracker.start(
             key, _span_name(data, span_type), _KINDS.get(span_type, "custom"),
             parent=parent,
@@ -253,15 +285,25 @@ _installed: CostKeyTracingProcessor | None = None
 _install_lock = threading.Lock()
 
 
-def instrument() -> CostKeyTracingProcessor:
-    """Register one CostKeyTracingProcessor with ``agents.add_trace_processor``."""
+def instrument(*, exclusive: bool = False) -> CostKeyTracingProcessor:
+    """Register one CostKeyTracingProcessor with the Agents SDK.
+
+    ``exclusive=True`` makes it the only trace processor
+    (``agents.set_trace_processors``): the SDK's default exporter, which sends
+    traces to OpenAI, is removed. Use it when tracing is on only for CostKey.
+    """
     global _installed
-    from agents import add_trace_processor
+    from agents import add_trace_processor, set_trace_processors
 
     with _install_lock:
         if _installed is None:
             _installed = CostKeyTracingProcessor()
-            add_trace_processor(_installed)
+            if exclusive:
+                set_trace_processors([_installed])
+            else:
+                add_trace_processor(_installed)
+        elif exclusive:
+            set_trace_processors([_installed])
         return _installed
 
 
