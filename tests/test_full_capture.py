@@ -1,6 +1,7 @@
 """With body capture on, content is sent whole; the transport splits by bytes."""
 from __future__ import annotations
 
+import gzip
 import json
 
 import httpx
@@ -105,6 +106,8 @@ class _Recorder:
 
     def __call__(self, url, *, content, headers, timeout):
         assert headers["Content-Type"] == "application/json"
+        if headers.get("Content-Encoding") == "gzip":
+            content = gzip.decompress(content)
         self.bodies.append(content)
         return httpx.Response(self.statuses.pop(0) if self.statuses else 202)
 
@@ -172,3 +175,19 @@ def test_a_failed_byte_batch_is_requeued_in_order(monkeypatch):
     assert recorder.batches()[1:] == [["e0", "e1"], ["e2"]]
     assert transport._queue == []
     assert transport._consecutive_failures == 0
+
+
+def test_transport_gzips_deliveries(monkeypatch):
+    sent = {}
+
+    def post(url, *, content, headers, timeout):
+        sent["headers"], sent["content"] = headers, content
+        return httpx.Response(202)
+
+    monkeypatch.setattr(transport_module.httpx, "post", post)
+    transport = Transport("https://x.test/api/v1/events", "k", 50, 5, False)
+    transport._queue = [_event("big", 500_000)]
+    transport.flush()
+    assert sent["headers"]["Content-Encoding"] == "gzip"
+    assert len(sent["content"]) < 10_000, "half a megabyte of prompt compresses to a few KB"
+    assert json.loads(gzip.decompress(sent["content"]))["events"][0]["requestBody"]["text"] == "x" * 500_000

@@ -4,6 +4,7 @@ Enqueue is non-blocking; explicit flush/shutdown may wait for best-effort
 delivery at an application-owned lifecycle boundary.
 """
 from __future__ import annotations
+import gzip
 import json
 import time
 import threading
@@ -40,6 +41,7 @@ def _sanitize_url(value: Any) -> str:
         return ""
 
 MAX_QUEUE_SIZE = 500
+GZIP_MIN_BYTES = 1024
 # Serialized JSON per POST. The ingest server accepts up to 32 MB (Cloud Run
 # caps HTTP/1 requests at 32 MiB); batches stay well under that. A single
 # event larger than this still goes, alone.
@@ -214,17 +216,23 @@ class Transport:
             logger.warning(f"[costkey] Dropped {len(batch)} events that could not be serialized: {e}")
             return True
 
+        headers = {
+            "Authorization": f"Bearer {self._auth_key}",
+            "User-Agent": f"costkey-python/{__version__}",
+            "Content-Type": "application/json",
+        }
+        # Prompts compress well: gzip anything past a small batch.
+        if len(body) > GZIP_MIN_BYTES:
+            body = gzip.compress(body, compresslevel=6)
+            headers["Content-Encoding"] = "gzip"
+
         try:
             from costkey.patch import internal_http
             with internal_http():
                 resp = httpx.post(
                     self._endpoint,
                     content=body,
-                    headers={
-                        "Authorization": f"Bearer {self._auth_key}",
-                        "User-Agent": f"costkey-python/{__version__}",
-                        "Content-Type": "application/json",
-                    },
+                    headers=headers,
                     # Large captured bodies take longer to upload.
                     timeout=httpx.Timeout(10, write=max(10.0, len(body) / (256 * 1024))),
                 )

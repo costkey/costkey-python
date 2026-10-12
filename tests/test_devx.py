@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import gzip
 import json
 import threading
 import time
@@ -16,6 +17,12 @@ import costkey.patch as patch_module
 from costkey.policy import CostKeyPolicyRefused, PolicyOptions
 from costkey.transport import Transport
 
+
+
+def _read_body(handler, length):
+    """The request body, unpacked when the SDK gzipped it."""
+    raw = handler.rfile.read(length)
+    return gzip.decompress(raw) if handler.headers.get("Content-Encoding") == "gzip" else raw
 
 class CaptureTransport:
     def __init__(self) -> None:
@@ -308,7 +315,7 @@ def test_init_uses_real_config_and_ingest_http_without_emitting_provider_secrets
 
         def do_POST(self):
             length = int(self.headers.get("Content-Length", "0"))
-            body = json.loads(self.rfile.read(length) or b"{}")
+            body = json.loads(_read_body(self, length) or b"{}")
             received.append((self.path, body, self.headers.get("Authorization")))
             if self.path == "/provider-privacy":
                 response = {
@@ -716,7 +723,7 @@ def test_real_http_provider_admit_and_settle_lifecycle():
     class Handler(BaseHTTPRequestHandler):
         def do_POST(self):
             length = int(self.headers.get("Content-Length", "0"))
-            body = json.loads(self.rfile.read(length) or b"{}")
+            body = json.loads(_read_body(self, length) or b"{}")
             requests.append((self.path, body, self.headers.get("Authorization")))
             if self.path.endswith("/policy/admit"):
                 response = {
@@ -837,7 +844,7 @@ def test_init_policy_uses_canonical_dsn_routes_and_settles_real_provider_call():
 
         def do_POST(self):
             length = int(self.headers.get("Content-Length", "0"))
-            body = json.loads(self.rfile.read(length) or b"{}")
+            body = json.loads(_read_body(self, length) or b"{}")
             received.append((self.path, body, self.headers.get("Authorization")))
             if self.path.endswith("/policy/admit"):
                 response = {
