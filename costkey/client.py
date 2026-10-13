@@ -431,6 +431,8 @@ def start_trace(
         "traceName": trace_name,
     }
     owned_token = _trace_scope_owned.set(True)
+    from costkey.stack import forget_scope_site, remember_scope_site
+    site_token = remember_scope_site()
     try:
         with with_context(child_context):
             emit_lifecycle(
@@ -477,6 +479,7 @@ def start_trace(
                     duration_ms=elapsed,
                 )
     finally:
+        forget_scope_site(site_token)
         _trace_scope_owned.reset(owned_token)
 
 
@@ -673,6 +676,7 @@ class _SpanScope:
         self._handle: SpanHandle | None = None
         self._base: dict[str, Any] = {}
         self._started: datetime.datetime | None = None
+        self._site_token: Any = None
 
     def _clone(self) -> "_SpanScope":
         return _SpanScope(
@@ -709,6 +713,8 @@ class _SpanScope:
         if not self.detached:
             self._previous = _context.get()
             self._token = _context.set(child)
+            from costkey.stack import remember_scope_site
+            self._site_token = remember_scope_site()
         from costkey.patch import _span_opened
         _span_opened(sid)
         handle = SpanHandle(sid, str(child.get("traceId")))
@@ -786,6 +792,9 @@ class _SpanScope:
         return False
 
     def _restore_context(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        from costkey.stack import forget_scope_site
+        forget_scope_site(self._site_token)
+        self._site_token = None
         try:
             _context.reset(self._token)
         except ValueError:
