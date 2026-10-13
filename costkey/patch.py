@@ -2108,6 +2108,7 @@ def emit_span(
     attributes: dict[str, Any] | None = None,
     input: Any = None,
     output: Any = None,
+    call_site: Any = None,
 ) -> None:
     """Enqueue one delivery of an agent/step/tool span (start or end)."""
     attrs = dict(attributes or {})
@@ -2136,6 +2137,7 @@ def emit_span(
         span_name=name,
         span_status=status,
         attributes=_scrub(attrs) if attrs else None,
+        call_site=call_site,
     )
     _dispatch_event(event)
 

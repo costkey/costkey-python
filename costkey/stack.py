@@ -16,7 +16,6 @@ import re
 import sys
 import sysconfig
 import traceback
-from contextvars import ContextVar, Token
 
 from costkey.types import CallSite, StackFrame
 
@@ -135,27 +134,9 @@ def add_source_context(frames: list[StackFrame]) -> None:
             continue
 
 
-def _is_entry_point(frame: StackFrame) -> bool:
-    """A process entry point (``__main__.py``, a module body) says nothing about which code made a call."""
-    base = os.path.basename(frame.file_name or "")
-    return base == "__main__.py" or frame.function_name == "<module>"
-
-
-def has_own_code(frames: list[StackFrame]) -> bool:
-    """Whether a stack passes through the caller's own code, beyond the process entry point."""
-    return any(is_in_app(frame.file_name) and not _is_entry_point(frame) for frame in frames)
-
-
-# Where the innermost agent, step or trace was opened in the caller's code.
-# Frameworks such as the OpenAI Agents SDK make their model calls on their own
-# tasks, whose stacks hold only library code and the server's entry point; those
-# calls are attributed to the code that opened the scope they run in.
-_scope_site: ContextVar[CallSite | None] = ContextVar("costkey_scope_site", default=None)
-
-
-def _capture(skip: int) -> CallSite | None:
+def capture_call_site() -> CallSite | None:
     try:
-        summary = traceback.extract_stack(sys._getframe(skip + 1))
+        summary = traceback.extract_stack(sys._getframe(1))
     except Exception:
         return None
     frames = [
@@ -166,33 +147,3 @@ def _capture(skip: int) -> CallSite | None:
         return None
     add_source_context(frames)
     return CallSite(raw="".join(traceback.format_list(summary)), frames=frames)
-
-
-def remember_scope_site() -> Token[CallSite | None] | None:
-    """Record where the caller's code opened a scope. Scopes opened by library
-    code (integrations) keep the enclosing one's. Returns a token to reset."""
-    try:
-        site = _capture(2)
-        if site is None or not has_own_code(site.frames):
-            return None
-        return _scope_site.set(site)
-    except Exception:
-        return None
-
-
-def forget_scope_site(token: Token[CallSite | None] | None) -> None:
-    if token is None:
-        return
-    try:
-        _scope_site.reset(token)
-    except ValueError:
-        # Closed from another context (framework hooks): nothing to restore here.
-        pass
-
-
-def capture_call_site() -> CallSite | None:
-    site = _capture(1)
-    if site is not None and has_own_code(site.frames):
-        return site
-    scope = _scope_site.get()
-    return scope if scope is not None else site
