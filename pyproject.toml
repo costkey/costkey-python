@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "costkey"
-version = "0.7.7"
+version = "0.7.8"
 description = "AI cost observability: captures raw telemetry from AI provider calls and agent frameworks; CostKey's server does the pricing and analysis."
 readme = "README.md"
 license = "MIT"

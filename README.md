@@ -64,7 +64,7 @@ PYTHONPATH="$PWD/.costkey:$PYTHONPATH" uvicorn app:app
 The bootstrap reads:
 
 - `COSTKEY_DSN`
-- `COSTKEY_RELEASE`
+- `COSTKEY_RELEASE`, `COSTKEY_COMMIT`, `COSTKEY_REPOSITORY` (see [Releases and Commits](#releases-and-commits))
 - `COSTKEY_CAPTURE_BODY=false` (unset leaves the server project setting in control)
 - `COSTKEY_DEBUG=true`
 
@@ -121,6 +121,35 @@ with costkey.with_context(feature="search", team="growth", customer_id="cus_123"
         max_tokens=1024,
     )
 ```
+
+## Releases and Commits
+
+Every batch says which release, commit and repository the running code came
+from, so CostKey can show the deploy each call came from, link it to the
+commit, and compare deploys.
+
+```py
+costkey.init(dsn=os.environ["COSTKEY_DSN"])  # detected
+costkey.init(dsn=..., release="v1.4.0", commit=sha, repository="https://github.com/org/app")
+```
+
+- `release`: the `release=` argument, else `COSTKEY_RELEASE`, else the commit SHA.
+- `commit`: the `commit=` argument, else `COSTKEY_COMMIT`, else the commit your
+  CI or host sets (`GITHUB_SHA`, `VERCEL_GIT_COMMIT_SHA`, `RENDER_GIT_COMMIT`,
+  `RAILWAY_GIT_COMMIT_SHA`, `CF_PAGES_COMMIT_SHA`, `CI_COMMIT_SHA`,
+  `BITBUCKET_COMMIT`, `CIRCLE_SHA1`, `COMMIT_REF`, `HEROKU_SLUG_COMMIT`,
+  `SOURCE_VERSION`, `CODEBUILD_RESOLVED_SOURCE_VERSION`, `SOURCE_COMMIT`,
+  `GIT_COMMIT`, `GIT_SHA`, `COMMIT_SHA`), else `.git` above `project_root` or
+  the working directory. Only 7 to 40 hex characters count.
+- `repository`: the `repository=` argument, else `COSTKEY_REPOSITORY`, else the
+  CI or host variables (GitHub Actions, Vercel, Render, Railway, GitLab,
+  Bitbucket, CircleCI), else the `origin` remote in `.git/config`. It is sent
+  as `https://host/owner/repo`; credentials in a remote URL are always removed.
+
+Detection reads files and environment variables once at `init`; it runs no
+`git` subprocess. Anything it cannot find is left out. Docker images built
+without `.git` need `COSTKEY_COMMIT` (or `COSTKEY_RELEASE`) set at build or
+deploy time.
 
 ## Agents
 

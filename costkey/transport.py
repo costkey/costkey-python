@@ -86,13 +86,16 @@ def _fit_bytes(events: list[dict[str, Any]], limit: int) -> list[dict[str, Any]]
 
 class Transport:
     def __init__(self, endpoint: str, auth_key: str, max_batch_size: int,
-                 flush_interval: float, debug: bool, release: str | None = None):
+                 flush_interval: float, debug: bool, release: str | None = None,
+                 commit: str | None = None, repository: str | None = None):
         self._endpoint = endpoint
         self._auth_key = auth_key
         self._max_batch_size = max(1, int(max_batch_size))
         self._flush_interval = max(0.01, float(flush_interval))
         self._debug = debug
         self._release = release
+        self._commit = commit
+        self._repository = repository
         self._queue: list[dict[str, Any]] = []
         self._lock = threading.Lock()
         # One long-lived worker handles all automatic delivery.  Enqueue only
@@ -218,6 +221,10 @@ class Transport:
         payload: dict[str, Any] = {"sdkVersion": f"python-{__version__}", "events": batch}
         if self._release:
             payload["release"] = self._release
+        if self._commit:
+            payload["commit"] = self._commit
+        if self._repository:
+            payload["repository"] = self._repository
 
         try:
             body = _encode(payload)

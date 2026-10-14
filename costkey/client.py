@@ -258,6 +258,8 @@ def init(dsn: str | None = None, *, capture_body: bool | None = None,
          max_batch_size: int = 50, flush_interval: float = 5.0,
          debug: bool = False, default_context: dict[str, Any] | None = None,
          release: str | None = None,
+         commit: str | None = None,
+         repository: str | None = None,
          project_root: str | None = None,
          scan_callgraph: bool = True,
          policy: Any = None,
@@ -275,6 +277,11 @@ def init(dsn: str | None = None, *, capture_body: bool | None = None,
 
     If no DSN is provided, falls back to COSTKEY_DSN env var.
     If neither exists, silently no-ops (test mode).
+
+    ``release`` falls back to ``COSTKEY_RELEASE``, then to the commit. The
+    commit and repository are detected when not given: ``COSTKEY_COMMIT`` /
+    ``COSTKEY_REPOSITORY``, then CI and hosting platform variables, then the
+    ``.git`` directory above ``project_root`` (or the working directory).
     """
     global _transport, _initialized
 
@@ -302,10 +309,16 @@ def init(dsn: str | None = None, *, capture_body: bool | None = None,
         auth_key=auth_key,
     )
 
+    from costkey.source import detect_commit, detect_repository
+    resolved_commit = detect_commit(commit, start=project_root)
+    resolved_repository = detect_repository(repository, start=project_root)
+    release = release or os.environ.get("COSTKEY_RELEASE") or resolved_commit
+
     _transport = Transport(
         endpoint=endpoint, auth_key=auth_key,
         max_batch_size=max_batch_size, flush_interval=flush_interval,
         debug=debug, release=release,
+        commit=resolved_commit, repository=resolved_repository,
     )
 
     initial_context = _canonical_context(default_context)
@@ -349,6 +362,8 @@ def init(dsn: str | None = None, *, capture_body: bool | None = None,
 
     if debug:
         logger.info(f"[costkey] Initialized for project {project_id}")
+        logger.info(f"[costkey] release={release or 'unknown'} commit={resolved_commit or 'unknown'} "
+                    f"repository={resolved_repository or 'unknown'}")
 
 
 # Alias for MLflow familiarity
