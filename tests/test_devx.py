@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import gzip
 import json
 import threading
 import time
@@ -13,11 +14,15 @@ import pytest
 
 import costkey.client as client
 import costkey.patch as patch_module
-from costkey.livekit import record_livekit_usage
 from costkey.policy import CostKeyPolicyRefused, PolicyOptions
-from costkey.providers import OpenAIExtractor, apply_runtime_providers, find_extractor
 from costkey.transport import Transport
 
+
+
+def _read_body(handler, length):
+    """The request body, unpacked when the SDK gzipped it."""
+    raw = handler.rfile.read(length)
+    return gzip.decompress(raw) if handler.headers.get("Content-Encoding") == "gzip" else raw
 
 class CaptureTransport:
     def __init__(self) -> None:
@@ -62,10 +67,6 @@ def capture_events():
     finally:
         for key, value in previous.items():
             setattr(state, key, value)
-        with client._usage_lock:
-            client._usage_updates.clear()
-            client._usage_modes.clear()
-            client._usage_event_ids.clear()
 
 
 def test_trace_lifecycle_is_non_billable_and_context_is_restored():
@@ -303,7 +304,7 @@ def test_init_uses_real_config_and_ingest_http_without_emitting_provider_secrets
                     "bodyCaptureEnabled": False,
                     "redactionEnabled": True,
                 },
-                "providers": [],
+                "providers": [{"id": "fixture", "hostname": "127.0.0.1"}],
             }).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
@@ -314,7 +315,7 @@ def test_init_uses_real_config_and_ingest_http_without_emitting_provider_secrets
 
         def do_POST(self):
             length = int(self.headers.get("Content-Length", "0"))
-            body = json.loads(self.rfile.read(length) or b"{}")
+            body = json.loads(_read_body(self, length) or b"{}")
             received.append((self.path, body, self.headers.get("Authorization")))
             if self.path == "/provider-privacy":
                 response = {
@@ -336,32 +337,6 @@ def test_init_uses_real_config_and_ingest_http_without_emitting_provider_secrets
         def log_message(self, *_args):
             return
 
-    class PrivacyExtractor:
-        provider = "fixture"
-
-        def match(self, url):
-            return urlparse(url).path == "/provider-privacy"
-
-        def extract_usage(self, body):
-            usage = body.get("usage") if isinstance(body, dict) else None
-            if not isinstance(usage, dict):
-                return None
-            from costkey.types import NormalizedUsage
-            return NormalizedUsage(
-                input_tokens=usage.get("input_tokens"),
-                output_tokens=usage.get("output_tokens"),
-                total_tokens=(usage.get("input_tokens") or 0) + (usage.get("output_tokens") or 0),
-            )
-
-        def extract_model(self, request_body, response_body):
-            for body in (response_body, request_body):
-                if isinstance(body, dict) and isinstance(body.get("model"), str):
-                    return body["model"]
-            return None
-
-    from urllib.parse import urlparse
-    from costkey.providers import register_extractor
-    register_extractor(PrivacyExtractor())
     server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     base = f"http://127.0.0.1:{server.server_address[1]}"
@@ -396,32 +371,24 @@ def test_init_uses_real_config_and_ingest_http_without_emitting_provider_secrets
     wire = ingest[-1]["events"][0]
     assert wire["requestBody"] is None
     assert wire["responseBody"] is None
-    assert wire["metadata"] == {"raw": {"promptCount": 1, "promptRoles": ["user"]}}
+    assert wire["metadata"] is None
+    assert wire["provider"] == "fixture"
     assert wire["url"] == f"http://127.0.0.1:{server.server_address[1]}/provider-privacy"
+    telemetry = wire["telemetry"]
+    assert telemetry["request"]["url"] == f"http://127.0.0.1:{server.server_address[1]}/provider-privacy"
+    assert telemetry["request"]["body"] == {
+        "model": "fixture-model",
+        "messages": [{"role": {"$s": 4}, "content": {"$s": 11}}],
+    }
+    assert telemetry["response"]["status"] == 202
+    assert telemetry["response"]["headers"]["content-type"] == "application/json"
+    assert "body-secret" not in json.dumps(ingest)
+    # Only the provider call is captured: ingest and config requests are the SDK's own.
+    assert [event["eventType"] for batch in ingest for event in batch["events"]] == ["call"]
     assert "provider-secret" not in json.dumps(ingest)
     assert "provider-password" not in json.dumps(ingest)
     assert wire["context"]["traceId"] == "privacy-trace"
 
-
-def test_metadata_safe_capture_gate_removes_body_and_prompt_fields_on_wire():
-    state = patch_module._state
-    with capture_events() as transport:
-        state.capture_body = False
-        request = {"model": "gpt-4o", "messages": [{"role": "user", "content": "private"}]}
-        response = {"id": "provider-1", "model": "gpt-4o", "usage": {"prompt_tokens": 1, "completion_tokens": 1}}
-        patch_module._process(
-            OpenAIExtractor(), "https://api.openai.com/v1/chat/completions?key=secret", "POST", 200,
-            request, response, 1, False, None, None, {"traceId": "trace"}, event_id="call-1",
-        )
-        wire = Transport("https://example.test", "key", 50, 5, False)._serialize(transport.events[0])
-    assert wire["requestBody"] is None
-    assert wire["responseBody"] is None
-    assert wire["metadata"] == {
-        "raw": {"promptCount": 1, "promptRoles": ["user"]},
-    }
-    assert "private" not in json.dumps(wire)
-    assert wire["systemPrompt"] is None
-    assert "secret" not in wire["url"]
 
 
 def test_carrier_allowlist_accepts_only_finite_scalars_and_headers_case_insensitively():
@@ -642,106 +609,8 @@ def test_explicit_carrier_is_imported_then_removed_before_provider_transport():
     assert "privateLabel" not in transport.events[0].context
 
 
-def test_record_usage_deduplicates_and_preserves_cumulative_snapshots():
-    with capture_events() as transport:
-        client.record_usage(
-            event_id="voice-1-r1",
-            component_id="voice:stt",
-            charge_id="voice:stt",
-            provider="deepgram",
-            usage={"audioSeconds": 1.0},
-            aggregation="cumulative",
-            revision=1,
-        )
-        client.record_usage(
-            event_id="voice-1-r2",
-            component_id="voice:stt",
-            charge_id="voice:stt",
-            provider="deepgram",
-            usage={"audioSeconds": 2.0},
-            aggregation="cumulative",
-            revision=2,
-        )
-        # Same charge/revision and payload is idempotent, even with a new ID.
-        client.record_usage(
-            event_id="voice-1-r2-retry",
-            component_id="voice:stt",
-            charge_id="voice:stt",
-            provider="deepgram",
-            usage={"audioSeconds": 2.0},
-            aggregation="cumulative",
-            revision=2,
-        )
-        # Older snapshots are ignored, not converted to a negative delta.
-        client.record_usage(
-            event_id="voice-1-old",
-            component_id="voice:stt",
-            charge_id="voice:stt",
-            provider="deepgram",
-            usage={"audioSeconds": 1.5},
-            aggregation="cumulative",
-            revision=0,
-        )
-
-        assert [event.id for event in transport.events] == ["voice-1-r1", "voice-1-r2"]
-        serialized = Transport("https://example.test", "key", 50, 5, False)._serialize(transport.events[-1])
-        assert serialized["eventType"] == "usage"
-        assert serialized["componentId"] == "voice:stt"
-        assert serialized["chargeId"] == "voice:stt"
-        assert serialized["aggregation"] == "cumulative"
-        assert serialized["revision"] == 2
-        assert serialized["usage"] == {"audioSeconds": 2.0}
-        assert "usageEvent" not in serialized
 
 
-def test_usage_conflicting_revision_and_modes_are_rejected():
-    with capture_events():
-        kwargs = dict(
-            component_id="component",
-            charge_id="charge",
-            provider="provider",
-            usage={"seconds": 1},
-            aggregation="delta",
-            revision=1,
-        )
-        client.record_usage(event_id="one", **kwargs)
-        with pytest.raises(ValueError, match="conflicting usage update"):
-            client.record_usage(event_id="two", **{**kwargs, "usage": {"seconds": 2}})
-        with pytest.raises(ValueError, match="cannot switch aggregation"):
-            client.record_usage(event_id="three", **{**kwargs, "aggregation": "cumulative", "revision": 2})
-
-
-def test_record_usage_normalizes_provider_and_cost_aliases():
-    with capture_events() as transport:
-        client.record_usage({
-            "id": "cost-alias",
-            "componentId": "meter",
-            "chargeId": "meter-charge",
-            "provider": None,
-            "costUsd": 0.03,
-            "currency": " usd ",
-            "usage": {"requests": 1},
-            "aggregation": "delta",
-            "revision": 1,
-        })
-    assert transport.events[0].provider == "unknown"
-    assert transport.events[0].amount == {"value": 0.03, "currency": "USD"}
-
-
-def test_record_usage_keeps_currency_when_amount_is_unknown():
-    with capture_events() as transport:
-        client.record_usage(
-            event_id="unknown-inr",
-            component_id="meter",
-            provider="meter",
-            usage={"requests": None},
-            currency="inr",
-            revision=1,
-            aggregation="delta",
-        )
-    wire = Transport("https://example.test", "key", 50, 5, False)._serialize(transport.events[0])
-    assert wire.get("amount") is None
-    assert wire["currency"] == "INR"
 
 
 def test_record_usage_accepts_contract_shaped_mapping_and_id_alias():
@@ -767,27 +636,6 @@ def test_record_usage_accepts_contract_shaped_mapping_and_id_alias():
     assert event.metadata == {"source": "fixture", "api_key": "[REDACTED]"}
 
 
-def test_record_usage_rejects_non_numeric_or_negative_units():
-    with capture_events():
-        with pytest.raises(TypeError, match="usage.seconds"):
-            client.record_usage(
-                event_id="bad",
-                component_id="component",
-                provider="custom",
-                usage={"seconds": -1},
-                revision=1,
-                aggregation="delta",
-            )
-        with pytest.raises(TypeError, match="usage.seconds"):
-            client.record_usage(
-                event_id="nan",
-                component_id="component",
-                provider="custom",
-                usage={"seconds": float("nan")},
-                revision=2,
-                aggregation="delta",
-            )
-
 
 def test_export_context_is_allowlisted():
     with client.with_context(traceId="trace", executionId="exec", api_key="secret", prompt="private"):
@@ -804,160 +652,11 @@ def test_context_header_roundtrip_remains_explicit_and_allowlisted():
     assert client.import_context(headers["x-costkey-context"]) == {"traceId": "trace"}
 
 
-def test_livekit_model_usage_fixture_reports_components_once():
-    class Usage:
-        def __init__(self, provider, model, **values):
-            self.provider = provider
-            self.model = model
-            self.__dict__.update(values)
-
-    class SessionUsage:
-        def __init__(self):
-            self.model_usage = [
-                Usage("deepgram", "nova-3", audio_duration=1.25, input_audio_tokens=20, output_text_tokens=4),
-                Usage("openai", "gpt-4o", input_tokens=10, output_tokens=5),
-                Usage("elevenlabs", "turbo", characters_count=30, audio_duration=2.0),
-            ]
-
-    class Update:
-        session_id = "room-1"
-        usage = SessionUsage()
-
-    with capture_events() as transport:
-        ids = record_livekit_usage(Update(), revision=7, expected_components=("stt", "llm", "tts"))
-        assert len(ids) == 3
-        assert {event.component_id for event in transport.events} == {
-            "livekit:room-1:stt:deepgram:nova-3",
-            "livekit:room-1:llm:openai:gpt-4o",
-            "livekit:room-1:tts:elevenlabs:turbo",
-        }
-        assert all(event.aggregation == "cumulative" and event.revision == 7 for event in transport.events)
-        assert all(event.metadata["livekit"]["revision"] == 7 for event in transport.events)
-        assert {
-            json.dumps(event.context["voiceCoverage"], sort_keys=True)
-            for event in transport.events
-        } == {
-            json.dumps({
-                "expectedComponents": ["llm", "stt", "tts"],
-                "observedComponents": ["llm", "stt", "tts"],
-                "missingComponents": [],
-                "excludedComponents": [],
-            }, sort_keys=True),
-        }
 
 
-def test_livekit_model_usage_dict_fixture_uses_declared_component_type():
-    with capture_events() as transport:
-        record_livekit_usage({
-            "usage": {
-                "model_usage": [
-                    {"type": "stt_usage", "provider": "deepgram", "model": "nova", "audio_duration": 1.0},
-                    {"type": "tts_usage", "provider": "elevenlabs", "model": "turbo", "characters_count": 12},
-                ],
-            },
-        }, session_id="room-2", revision=1)
-    assert [event.context["voiceSessionId"] for event in transport.events] == ["room-2", "room-2"]
-    assert [event.component_id.split(":")[3] for event in transport.events] == ["deepgram", "elevenlabs"]
 
 
-def test_livekit_billing_units_are_authoritative_and_drop_derived_total_tokens():
-    with capture_events() as transport:
-        record_livekit_usage({
-            "model_usage": [{
-                "type": "llm_usage",
-                "provider": "openai",
-                "model": "gpt-4o",
-                "input_tokens": 3,
-                "output_tokens": 2,
-                "total_tokens": 5,
-            }],
-        }, session_id="room-billing", revision=1)
-        event = transport.events[0]
-        assert event.billing_units == {"input_tokens": 3, "output_tokens": 2}
-        wire = Transport("https://example.test", "key", 50, 5, False)._serialize(event)
-    assert wire["billingUnits"] == {"input_tokens": 3, "output_tokens": 2}
 
-
-def test_livekit_mixed_native_billing_families_require_explicit_selection_without_amount():
-    with capture_events() as transport:
-        record_livekit_usage({
-            "model_usage": [{
-                "type": "llm_usage",
-                "provider": "openai",
-                "model": "gpt-4o",
-                "input_tokens": 3,
-                "audio_duration": 1.5,
-            }],
-        }, session_id="room-mixed", revision=1)
-    event = transport.events[0]
-    assert event.billing_units is None
-    assert event.context["voiceBilling"]["status"] == "selection_required"
-
-
-def test_livekit_reordered_rows_keep_provider_model_ids_and_full_coverage():
-    first = {
-        "model_usage": [
-            {"type": "llm_usage", "provider": "provider-a", "model": "same-model", "input_tokens": 1},
-            {"type": "llm_usage", "provider": "provider-b", "model": "same-model", "input_tokens": 2},
-            {"type": "stt_usage", "provider": "deepgram", "model": "nova", "audio_duration": 1},
-        ],
-    }
-    second = {"model_usage": list(reversed(first["model_usage"]))}
-    with capture_events() as transport:
-        record_livekit_usage(first, session_id="room-reordered", revision=1,
-                             expected_components=("stt", "llm", "tts"))
-        ids_first = {event.component_id for event in transport.events}
-        coverage_first = {json.dumps(event.context["voiceCoverage"], sort_keys=True) for event in transport.events}
-        transport.events.clear()
-        # A reordered cumulative snapshot should address the same charges;
-        # every emitted row should also expose the final missing-component set.
-        record_livekit_usage(second, session_id="room-reordered", revision=2,
-                             expected_components=("stt", "llm", "tts"))
-        ids_second = {event.component_id for event in transport.events}
-        coverage_second = {json.dumps(event.context["voiceCoverage"], sort_keys=True) for event in transport.events}
-    assert ids_first == ids_second
-    assert coverage_first == coverage_second == {
-        json.dumps({
-            "expectedComponents": ["llm", "stt", "tts"],
-            "observedComponents": ["llm", "stt"],
-            "missingComponents": ["tts"],
-            "excludedComponents": [],
-        }, sort_keys=True),
-    }
-
-
-def test_livekit_duplicate_provider_model_rows_use_stable_row_ids():
-    update = {
-        "model_usage": [
-            {"type": "llm_usage", "id": "request-b", "provider": "openai", "model": "gpt", "input_tokens": 2},
-            {"type": "llm_usage", "id": "request-a", "provider": "openai", "model": "gpt", "input_tokens": 1},
-        ],
-    }
-    with capture_events() as transport:
-        record_livekit_usage(update, session_id="room-ids", revision=1)
-        first_ids = {event.component_id for event in transport.events}
-        transport.events.clear()
-        record_livekit_usage({"model_usage": list(reversed(update["model_usage"]))}, session_id="room-ids", revision=2)
-        second_ids = {event.component_id for event in transport.events}
-    assert first_ids == second_ids == {
-        "livekit:room-ids:llm:openai:gpt:request-a",
-        "livekit:room-ids:llm:openai:gpt:request-b",
-    }
-
-
-def test_livekit_can_exclude_aggregate_llm_when_http_is_source_of_charge():
-    with capture_events() as transport:
-        record_livekit_usage({
-            "model_usage": [
-                {"type": "stt_usage", "provider": "deepgram", "model": "nova", "audio_duration": 1.0},
-                {"type": "llm_usage", "provider": "openai", "model": "gpt-4o", "input_tokens": 3, "output_tokens": 2},
-                {"type": "tts_usage", "provider": "elevenlabs", "model": "turbo", "characters_count": 4},
-            ],
-        }, session_id="room-3", revision=1, expected_components=("stt", "llm", "tts"), exclude_components={"llm"})
-    assert len(transport.events) == 2
-    assert {event.component_id.split(":")[2] for event in transport.events} == {"stt", "tts"}
-    assert all(event.context["voiceCoverage"]["excludedComponents"] == ["llm"] for event in transport.events)
-    assert all("llm" not in event.context["voiceCoverage"]["expectedComponents"] for event in transport.events)
 
 
 def test_enforced_admission_refusal_is_typed_and_prevents_provider_call():
@@ -1004,14 +703,15 @@ def test_policy_settlement_payload_releases_an_allowed_call():
     state.project_id = "project-test"
     try:
         decision = patch_module._run_admission_sync({"id": "call-1"})
-        patch_module._settle_sync(decision, None, 200, "call-1")
+        patch_module._settle_sync(decision, "call-1")
     finally:
         state.admission, state.admission_mode, state.project_id = previous
     assert settled == [{
         "projectId": "project-test",
         "reservationId": "reservation-1",
         "settlementId": "call-1:settlement",
-        "outcome": "success",
+        "eventId": "call-1",
+        "outcome": "unknown",
         "providerAttempted": True,
     }]
 
@@ -1023,7 +723,7 @@ def test_real_http_provider_admit_and_settle_lifecycle():
     class Handler(BaseHTTPRequestHandler):
         def do_POST(self):
             length = int(self.headers.get("Content-Length", "0"))
-            body = json.loads(self.rfile.read(length) or b"{}")
+            body = json.loads(_read_body(self, length) or b"{}")
             requests.append((self.path, body, self.headers.get("Authorization")))
             if self.path.endswith("/policy/admit"):
                 response = {
@@ -1055,31 +755,6 @@ def test_real_http_provider_admit_and_settle_lifecycle():
         def log_message(self, *_args):
             return
 
-    class FixtureExtractor:
-        provider = "fixture"
-
-        def match(self, url):
-            return url.endswith("/provider")
-
-        def extract_usage(self, body):
-            from costkey.types import NormalizedUsage
-            usage = body.get("usage") if isinstance(body, dict) else None
-            if not isinstance(usage, dict):
-                return None
-            return NormalizedUsage(
-                input_tokens=usage.get("input_tokens"),
-                output_tokens=usage.get("output_tokens"),
-                total_tokens=usage.get("total_tokens"),
-            )
-
-        def extract_model(self, request_body, response_body):
-            for body in (response_body, request_body):
-                if isinstance(body, dict) and isinstance(body.get("model"), str):
-                    return body["model"]
-            return None
-
-    from costkey.providers import register_extractor
-    register_extractor(FixtureExtractor())
     server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -1109,6 +784,8 @@ def test_real_http_provider_admit_and_settle_lifecycle():
     try:
         from costkey.policy import PolicyAdmissionOptions
         base = "http://127.0.0.1:%s" % server.server_address[1]
+        from costkey.providers import apply_runtime_hosts
+        apply_runtime_hosts([{"id": "fixture", "hostname": "127.0.0.1"}])
         state.admission = PolicyAdmissionOptions(
             f"{base}/api/v1/sdk/policy/admit",
             "dsn-key",
@@ -1121,6 +798,8 @@ def test_real_http_provider_admit_and_settle_lifecycle():
             response = http.post(f"{base}/provider", json={"model": "fixture-model"})
             assert response.status_code == 200
     finally:
+        from costkey.providers import clear_runtime_hosts
+        clear_runtime_hosts()
         if state.patched:
             patch_module.unpatch()
         for key, value in previous.items():
@@ -1136,8 +815,14 @@ def test_real_http_provider_admit_and_settle_lifecycle():
     admission_body = requests[0][1]
     assert admission_body["admissionId"] == admission_body["requestId"]
     assert admission_body["integration"]["verified"] is True
-    assert settled[0]["outcome"] == "success"
-    assert settled[0]["actualUsage"]["totalTokens"] == 5
+    assert admission_body["request"]["url"] == f"{base}/provider"
+    assert admission_body["request"]["body"] == {"model": "fixture-model"}
+    assert "usageBounds" not in admission_body and "model" not in admission_body
+    # The SDK reports the attempt; the server reconciles the outcome from the call event.
+    assert settled[0]["outcome"] == "unknown"
+    assert settled[0]["providerAttempted"] is True
+    assert settled[0]["eventId"] == settled[0]["settlementId"].split(":")[0]
+    assert "actualUsage" not in settled[0]
 
 
 def test_init_policy_uses_canonical_dsn_routes_and_settles_real_provider_call():
@@ -1149,7 +834,7 @@ def test_init_policy_uses_canonical_dsn_routes_and_settles_real_provider_call():
             payload = json.dumps({
                 "projectId": "policy-project",
                 "capture": {"mode": "metadata", "bodyCaptureEnabled": False, "redactionEnabled": True},
-                "providers": [],
+                "providers": [{"id": "fixture", "hostname": "127.0.0.1"}],
             }).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
@@ -1159,7 +844,7 @@ def test_init_policy_uses_canonical_dsn_routes_and_settles_real_provider_call():
 
         def do_POST(self):
             length = int(self.headers.get("Content-Length", "0"))
-            body = json.loads(self.rfile.read(length) or b"{}")
+            body = json.loads(_read_body(self, length) or b"{}")
             received.append((self.path, body, self.headers.get("Authorization")))
             if self.path.endswith("/policy/admit"):
                 response = {
@@ -1189,32 +874,6 @@ def test_init_policy_uses_canonical_dsn_routes_and_settles_real_provider_call():
         def log_message(self, *_args):
             return
 
-    class PolicyExtractor:
-        provider = "fixture"
-
-        def match(self, url):
-            return urlparse(url).path == "/provider-policy"
-
-        def extract_usage(self, body):
-            from costkey.types import NormalizedUsage
-            usage = body.get("usage") if isinstance(body, dict) else None
-            if not isinstance(usage, dict):
-                return None
-            return NormalizedUsage(
-                input_tokens=usage.get("input_tokens"),
-                output_tokens=usage.get("output_tokens"),
-                total_tokens=usage.get("total_tokens"),
-            )
-
-        def extract_model(self, request_body, response_body):
-            for body in (response_body, request_body):
-                if isinstance(body, dict) and isinstance(body.get("model"), str):
-                    return body["model"]
-            return None
-
-    from urllib.parse import urlparse
-    from costkey.providers import register_extractor
-    register_extractor(PolicyExtractor())
     server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     import costkey
@@ -1232,6 +891,9 @@ def test_init_policy_uses_canonical_dsn_routes_and_settles_real_provider_call():
             },
             config_refresh_interval=None,
         )
+        deadline = time.time() + 5
+        while patch_module.runtime_config_status() != "available" and time.time() < deadline:
+            time.sleep(0.01)
         with httpx.Client() as http:
             response = http.post(
                 f"http://provider-user:provider-pass@127.0.0.1:{port}/provider-policy?key=provider-secret",
@@ -1251,7 +913,8 @@ def test_init_policy_uses_canonical_dsn_routes_and_settles_real_provider_call():
     assert admission["admissionId"] == admission["requestId"]
     assert admission["integration"]["verified"] is True
     assert "requestBody" not in admission
-    assert settled and settled[0]["actualUsage"]["totalTokens"] == 5
+    assert settled and settled[0]["outcome"] == "unknown"
+    assert "actualUsage" not in settled[0]
     ingest = next(body for path, body, _auth in received if path == "/api/v1/events")
     event = ingest["events"][0]
     assert event["eventType"] == "call"
@@ -1260,22 +923,6 @@ def test_init_policy_uses_canonical_dsn_routes_and_settles_real_provider_call():
     assert "provider-secret" not in json.dumps(ingest)
     assert "provider-pass" not in json.dumps(ingest)
 
-
-def test_provider_native_units_and_reported_cost_are_preserved():
-    usage = OpenAIExtractor().extract_usage({
-        "model": "gpt-4o",
-        "usage": {
-            "prompt_tokens": 10,
-            "completion_tokens": 5,
-            "total_tokens": 15,
-            "cost": 0.004,
-            "input_audio_tokens": 12,
-            "audio_duration": 1.5,
-        },
-    })
-    assert usage is not None
-    assert usage.cost_usd == 0.004
-    assert usage.native_units == {"input_audio_tokens": 12, "audio_duration": 1.5}
 
 
 def test_provider_url_credentials_and_query_keys_are_not_emitted():
@@ -1299,24 +946,6 @@ def test_transport_sanitizes_legacy_event_url_at_outbound_boundary():
     assert serialized["url"] == "https://provider.example/v1"
     assert "sentinel" not in json.dumps(serialized)
 
-
-def test_runtime_provider_capabilities_are_applied_from_dsn_config():
-    apply_runtime_providers([{
-        "id": "custom-router",
-        "hostname": "llm.internal.test",
-        "usage_input_path": "usage.input_tokens",
-        "usage_output_path": "usage.output_tokens",
-        "model_path": "model",
-    }])
-    try:
-        extractor = find_extractor("https://llm.internal.test/v1/chat")
-        assert extractor is not None
-        usage = extractor.extract_usage({"model": "custom", "usage": {"input_tokens": 4, "output_tokens": 3}})
-        assert usage is not None
-        assert usage.total_tokens == 7
-        assert extractor.extract_model({"model": "requested"}, {"model": "served"}) == "served"
-    finally:
-        apply_runtime_providers([])
 
 
 def test_status_only_admission_failure_is_unavailable(monkeypatch):

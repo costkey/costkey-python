@@ -1,88 +1,149 @@
-"""Stack trace capture — auto-attribute AI calls to code."""
+"""Call-site capture: every frame of the stack, raw.
+
+The SDK does not decide which frames are "user code"; the server filters.
+Frames are innermost first.
+
+For the first few in-app frames (the caller's own code, not libraries, the
+standard library or CostKey itself) the SDK also attaches the source line
+and a few lines around it, so the console can show the code that made the
+call.
+"""
 from __future__ import annotations
+
+import linecache
+import os
+import re
+import sys
+import sysconfig
 import traceback
+
 from costkey.types import CallSite, StackFrame
 
-# Filter out library/framework internals — only keep user code
-_INTERNAL = (
-    # CostKey itself
-    "costkey/",
-    "site-packages/costkey",
-    # Python stdlib
-    "threading.py",
-    "concurrent/futures",
-    "asyncio/",
-    "importlib/",
-    "runpy.py",
-    "_bootstrap",
-    # HTTP clients (we patch these)
-    "site-packages/httpx",
-    "site-packages/httpcore",
-    "site-packages/requests",
-    "site-packages/urllib3",
-    "site-packages/aiohttp",
-    "site-packages/botocore",
-    "site-packages/boto3",
-    "site-packages/aiobotocore",
-    # AI SDKs (internal transport)
-    "site-packages/openai",
-    "site-packages/anthropic",
-    "site-packages/google",
-    "site-packages/cohere",
-    # Common frameworks
-    "site-packages/flask",
-    "site-packages/django",
-    "site-packages/fastapi",
-    "site-packages/starlette",
-    "site-packages/uvicorn",
-    "site-packages/gunicorn",
+# How many in-app frames get source context, and how much.
+MAX_CONTEXT_FRAMES = 8
+CONTEXT_LINES = 3
+MAX_LINE_CHARS = 500
+
+_COSTKEY_DIR = os.path.dirname(os.path.abspath(__file__)) + os.sep
+
+
+def _stdlib_dirs() -> tuple[str, ...]:
+    dirs: set[str] = set()
+    for key in ("stdlib", "platstdlib"):
+        try:
+            path = sysconfig.get_paths().get(key)
+        except Exception:
+            path = None
+        if path:
+            dirs.add(os.path.abspath(path) + os.sep)
+    return tuple(dirs)
+
+
+_STDLIB_DIRS = _stdlib_dirs()
+
+
+def is_in_app(file_name: str | None) -> bool:
+    """True for the caller's own code: not libraries, stdlib or CostKey."""
+    if not file_name or file_name.startswith("<"):
+        return False
+    norm = file_name.replace("\\", "/")
+    if "/site-packages/" in norm or "/dist-packages/" in norm or "<frozen" in norm:
+        return False
+    path = os.path.abspath(file_name)
+    if path.startswith(_COSTKEY_DIR):
+        return False
+    if _STDLIB_DIRS and path.startswith(_STDLIB_DIRS):
+        return False
+    return True
+
+
+# Source lines can hold hardcoded secrets. Redact the common shapes before
+# they leave the process: provider keys and tokens, URL credentials and query
+# strings, and string literals assigned to secret-looking names.
+_TOKEN = re.compile(
+    r"sk-ant-[A-Za-z0-9_\-]{20,}|sk-[A-Za-z0-9_\-]{20,}|AIza[A-Za-z0-9_\-]{30,}"
+    r"|eyJ[A-Za-z0-9_\-]{20,}(?:\.[A-Za-z0-9_\-]*){0,2}|xox[bpras]-[A-Za-z0-9-]{20,}"
+    r"|gh[pousr]_[A-Za-z0-9]{30,}|(?<=Bearer )[A-Za-z0-9._\-]{20,}"
 )
+_URL_USERINFO = re.compile(r"(://)[^/\s'\"@]+@")
+_URL_QUERY = re.compile(r"(://[^\s'\"?#]*\?)[^\s'\"#]*")
+_QUERY_SECRET = re.compile(
+    r"([?&](?:key|api[_-]?key|token|access[_-]?token|secret|sig|signature|password|auth)=)[^&\s'\"#]+",
+    re.IGNORECASE,
+)
+_SECRET_ASSIGN = re.compile(
+    r"((?:api[_-]?key|secret(?:[_-]?key)?|token|access[_-]?token|refresh[_-]?token|password|passwd"
+    r"|credential|authorization|private[_-]?key)['\"]?\s*[:=]\s*)(['\"])(?:(?!\2).)+\2",
+    re.IGNORECASE,
+)
+REDACTED = "[REDACTED]"
+
+
+def scrub_source_line(line: str) -> str:
+    line = _TOKEN.sub(REDACTED, line)
+    line = _URL_USERINFO.sub(r"\1" + REDACTED + "@", line)
+    line = _URL_QUERY.sub(r"\1" + REDACTED, line)
+    line = _QUERY_SECRET.sub(r"\1" + REDACTED, line)
+    line = _SECRET_ASSIGN.sub(lambda m: m.group(1) + m.group(2) + REDACTED + m.group(2), line)
+    return line
+
+
+def _clip(line: str) -> str:
+    line = line.rstrip("\r\n")[:MAX_LINE_CHARS]
+    try:
+        return scrub_source_line(line)
+    except Exception:
+        return line
+
+
+def _attach_context(frame: StackFrame, cache: dict[str, list[str]]) -> bool:
+    """Fill the frame's source context. Returns True when it was filled."""
+    file_name = frame.file_name
+    lineno = frame.line_number
+    if not file_name or not lineno or lineno < 1:
+        return False
+    lines = cache.get(file_name)
+    if lines is None:
+        try:
+            lines = linecache.getlines(file_name)
+        except Exception:
+            lines = []
+        cache[file_name] = lines
+    if lineno > len(lines):
+        return False
+    idx = lineno - 1
+    frame.context_line = _clip(lines[idx])
+    frame.pre_context = [_clip(l) for l in lines[max(0, idx - CONTEXT_LINES):idx]]
+    frame.post_context = [_clip(l) for l in lines[idx + 1:idx + 1 + CONTEXT_LINES]]
+    return True
+
+
+def add_source_context(frames: list[StackFrame]) -> None:
+    """Attach source lines to the first in-app frames. Never raises."""
+    cache: dict[str, list[str]] = {}
+    seen = 0
+    for frame in frames:
+        if seen >= MAX_CONTEXT_FRAMES:
+            break
+        try:
+            if not is_in_app(frame.file_name):
+                continue
+            seen += 1
+            _attach_context(frame, cache)
+        except Exception:
+            continue
 
 
 def capture_call_site() -> CallSite | None:
-    raw = traceback.format_stack()
-    frames: list[StackFrame] = []
-
-    for entry in reversed(raw):
-        # Each entry can be multi-line: 'File "...", line N, in func\n    code_line\n'
-        # Only parse the first line (the File line)
-        line = entry.strip().split("\n")[0].strip()
-        if not line.startswith("File "):
-            continue
-        # Parse: File "path", line N, in func
-        parts = line.split(", ")
-        if len(parts) < 3:
-            continue
-
-        file_name = parts[0].replace('File "', "").rstrip('"')
-
-        # Skip internal/library frames
-        if any(p in file_name for p in _INTERNAL):
-            continue
-        # Skip anything in Python's lib directory
-        if "/lib/python" in file_name and "site-packages" not in file_name:
-            continue
-        # Skip <frozen ...> and <string> frames
-        if file_name.startswith("<"):
-            continue
-
-        line_num = None
-        func_name = None
-        for p in parts[1:]:
-            if p.startswith("line "):
-                try:
-                    line_num = int(p.replace("line ", ""))
-                except ValueError:
-                    pass
-            elif p.startswith("in "):
-                func_name = p.replace("in ", "").strip()
-
-        frames.append(StackFrame(
-            function_name=func_name,
-            file_name=file_name,
-            line_number=line_num,
-        ))
-
+    try:
+        summary = traceback.extract_stack(sys._getframe(1))
+    except Exception:
+        return None
+    frames = [
+        StackFrame(function_name=frame.name, file_name=frame.filename, line_number=frame.lineno)
+        for frame in reversed(summary)
+    ]
     if not frames:
         return None
-    return CallSite(raw="".join(raw), frames=frames)
+    add_source_context(frames)
+    return CallSite(raw="".join(traceback.format_list(summary)), frames=frames)

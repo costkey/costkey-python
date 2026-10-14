@@ -4,8 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "costkey"
-version = "0.6.1"
-description = "AI cost observability for supported provider calls: cost, tokens, latency, prompts, and tool metadata without an extra provider-routing hop."
+version = "0.7.8"
+description = "AI cost observability: captures raw telemetry from AI provider calls and agent frameworks; CostKey's server does the pricing and analysis."
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.9"
@@ -28,6 +28,22 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# Framework integrations (costkey.integrations.*). Each is imported lazily;
+# `import costkey` never imports a framework.
+openai-agents = ["openai-agents>=0.22"]
+langchain = ["langchain-core>=1.0"]
+langgraph = ["langchain-core>=1.0", "langgraph>=1.0"]
+crewai = ["crewai>=1.15"]
+llama-index = ["llama-index-core>=0.14"]
+pydantic-ai = ["pydantic-ai-slim>=2.55"]
+google-adk = ["google-adk>=2.11"]
+claude-agent-sdk = ["claude-agent-sdk>=0.2.165"]
+smolagents = ["smolagents>=1.26"]
+autogen = ["autogen-agentchat>=0.7.5", "opentelemetry-sdk>=1.30"]
+ag2 = ["ag2>=1.1"]
+dspy = ["dspy>=3.4"]
+strands = ["strands-agents>=1.59"]
+opentelemetry = ["opentelemetry-sdk>=1.30"]
 test = ["pytest", "aiohttp", "botocore", "requests"]
 
 [project.scripts]

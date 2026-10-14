@@ -6,13 +6,12 @@ import math
 import os
 import uuid
 import logging
-import re
 import threading
 from collections.abc import Mapping
 from contextlib import contextmanager
 from contextvars import ContextVar
 from typing import Any, Callable, Generator
-from costkey.types import CostKeyOptions, CostKeyEvent
+from costkey.types import CostKeyEvent
 from costkey.transport import Transport
 from costkey.patch import (
     patch,
@@ -21,22 +20,15 @@ from costkey.patch import (
     get_context,
     emit_lifecycle,
     emit_span,
-    emit_score,
     _dispatch_event,
     _scrub,
     start_runtime_config_fetch,
 )
-from costkey.providers import register_extractor as _register_extractor
-from costkey.pricing import register_pricing as _register_pricing
 
 logger = logging.getLogger("costkey")
 
 _transport: Transport | None = None
 _initialized = False
-_usage_lock = threading.Lock()
-_usage_updates: dict[tuple[str, str, int], str] = {}
-_usage_modes: dict[tuple[str, str], str] = {}
-_usage_event_ids: dict[str, str] = {}
 _trace_scope_owned: ContextVar[bool] = ContextVar("costkey_trace_scope_owned", default=False)
 _execution_scope_owned: ContextVar[bool] = ContextVar("costkey_execution_scope_owned", default=False)
 
@@ -71,7 +63,7 @@ _EXPORT_CONTEXT_KEYS = frozenset({
 def _parse_dsn(dsn: str) -> tuple[str, str, str]:
     """Parse DSN → (endpoint, auth_key, project_id).
 
-    Expected format: http(s)://<key>@<your CostKey host>/<project-id>
+    Expected format: http(s)://<key>@<your CostKey host>[/<base-path>]/<project-id>
     """
     from urllib.parse import urlparse
 
@@ -89,13 +81,18 @@ def _parse_dsn(dsn: str) -> tuple[str, str, str]:
     if not auth_key:
         raise ValueError(f"[costkey] DSN missing auth key. {_DSN_HELP}")
 
-    project_id = parsed.path.lstrip("/")
+    # The project ID is the last path segment. Anything before it is the path
+    # CostKey is served under, e.g. https://<key>@portal.example.com/costkey/<project-id>.
+    segments = [part for part in parsed.path.split("/") if part]
+    project_id = segments.pop() if segments else ""
     if not project_id:
         raise ValueError(f"[costkey] DSN missing project ID. {_DSN_HELP}")
 
     endpoint = f"{parsed.scheme}://{parsed.hostname}"
     if parsed.port:
         endpoint += f":{parsed.port}"
+    if segments:
+        endpoint += "/" + "/".join(segments)
     endpoint += "/api/v1/events"
     return endpoint, auth_key, project_id
 
@@ -157,77 +154,19 @@ def _non_empty(value: Any) -> str | None:
     return value or None
 
 
-def _currency_code(value: Any) -> str | None:
+def _caller_map(value: Any, label: str) -> dict[str, Any] | None:
+    """A caller-supplied mapping, made JSON-safe and otherwise untouched."""
     if value is None:
         return None
-    if not isinstance(value, str) or not value.strip():
-        raise ValueError("amount currency must be a non-empty string")
-    normalized = value.strip().upper()
-    if not re.fullmatch(r"[A-Z][A-Z0-9_-]{2,9}", normalized):
-        raise ValueError("amount currency must be an ISO-like code")
-    return normalized
-
-
-def _amount_payload(amount: Any, currency: str | None) -> tuple[dict[str, Any] | None, float | None, str | None]:
-    if amount is None:
-        return None, None, _currency_code(currency)
-    if isinstance(amount, Mapping):
-        value = amount.get("value", amount.get("amount"))
-        amount_currency = amount.get("currency", currency or "USD")
-    else:
-        value = amount
-        amount_currency = currency or "USD"
-    if (
-        not isinstance(value, (int, float))
-        or isinstance(value, bool)
-        or not math.isfinite(value)
-        or value < 0
-    ):
-        raise TypeError("amount value must be a finite non-negative number")
-    normalized_currency = _currency_code(amount_currency)
-    assert normalized_currency is not None
-    value_float = float(value)
-    return {"value": value_float, "currency": normalized_currency}, (
-        value_float if normalized_currency == "USD" else None
-    ), normalized_currency
-
-
-def _usage_payload(usage: Any, native_units: Mapping[str, Any] | None = None) -> dict[str, Any] | None:
-    def usage_value(value: Any) -> Any:
-        # Keep non-finite floats intact until validation so NaN/Infinity are
-        # rejected rather than silently converted into an unknown null unit.
-        if isinstance(value, float) and not math.isfinite(value):
-            return value
-        return _json_safe(value)
-
-    if isinstance(usage, Mapping):
-        result = {str(key): usage_value(value) for key, value in usage.items()}
-    elif usage is None:
-        result = {}
-    elif hasattr(usage, "__dataclass_fields__"):
-        result = {}
-        for key in (
-            "input_tokens", "output_tokens", "total_tokens", "reasoning_tokens",
-            "cache_read_tokens", "cache_creation_tokens", "image_output_tokens",
-        ):
-            value = getattr(usage, key, None)
-            if value is not None:
-                result[key] = value
-        result.update({str(key): usage_value(value) for key, value in getattr(usage, "native_units", {}).items()})
-    else:
-        raise TypeError("usage must be a mapping or NormalizedUsage")
-    if native_units:
-        result.update({str(key): usage_value(value) for key, value in native_units.items()})
-    for key, value in result.items():
-        if value is None:
-            continue
-        if not isinstance(value, (int, float)) or isinstance(value, bool) or not math.isfinite(value) or value < 0:
-            raise TypeError(f"usage.{key} must be a finite non-negative number or null")
-    return result or None
-
-
-def _fingerprint(values: Mapping[str, Any]) -> str:
-    return json.dumps(_json_safe(values), sort_keys=True, separators=(",", ":"), default=str)
+    if not isinstance(value, Mapping):
+        try:
+            from costkey.telemetry import _plain
+            value = _plain(value)
+        except Exception:
+            raise TypeError(f"{label} must be a mapping") from None
+        if not isinstance(value, Mapping):
+            raise TypeError(f"{label} must be a mapping")
+    return {str(key): _json_safe(item) for key, item in value.items()}
 
 
 def _current_context() -> dict[str, Any]:
@@ -319,6 +258,8 @@ def init(dsn: str | None = None, *, capture_body: bool | None = None,
          max_batch_size: int = 50, flush_interval: float = 5.0,
          debug: bool = False, default_context: dict[str, Any] | None = None,
          release: str | None = None,
+         commit: str | None = None,
+         repository: str | None = None,
          project_root: str | None = None,
          scan_callgraph: bool = True,
          policy: Any = None,
@@ -336,6 +277,11 @@ def init(dsn: str | None = None, *, capture_body: bool | None = None,
 
     If no DSN is provided, falls back to COSTKEY_DSN env var.
     If neither exists, silently no-ops (test mode).
+
+    ``release`` falls back to ``COSTKEY_RELEASE``, then to the commit. The
+    commit and repository are detected when not given: ``COSTKEY_COMMIT`` /
+    ``COSTKEY_REPOSITORY``, then CI and hosting platform variables, then the
+    ``.git`` directory above ``project_root`` (or the working directory).
     """
     global _transport, _initialized
 
@@ -363,10 +309,16 @@ def init(dsn: str | None = None, *, capture_body: bool | None = None,
         auth_key=auth_key,
     )
 
+    from costkey.source import detect_commit, detect_repository
+    resolved_commit = detect_commit(commit, start=project_root)
+    resolved_repository = detect_repository(repository, start=project_root)
+    release = release or os.environ.get("COSTKEY_RELEASE") or resolved_commit
+
     _transport = Transport(
         endpoint=endpoint, auth_key=auth_key,
         max_batch_size=max_batch_size, flush_interval=flush_interval,
         debug=debug, release=release,
+        commit=resolved_commit, repository=resolved_repository,
     )
 
     initial_context = _canonical_context(default_context)
@@ -410,6 +362,8 @@ def init(dsn: str | None = None, *, capture_body: bool | None = None,
 
     if debug:
         logger.info(f"[costkey] Initialized for project {project_id}")
+        logger.info(f"[costkey] release={release or 'unknown'} commit={resolved_commit or 'unknown'} "
+                    f"repository={resolved_repository or 'unknown'}")
 
 
 # Alias for MLflow familiarity
@@ -425,10 +379,6 @@ def shutdown() -> None:
         _transport = None
     unpatch()
     _initialized = False
-    with _usage_lock:
-        _usage_updates.clear()
-        _usage_modes.clear()
-        _usage_event_ids.clear()
 
 
 def flush() -> None:
@@ -512,19 +462,19 @@ def start_trace(
             except BaseException as exc:
                 ended_at = _iso_timestamp()
                 elapsed = (datetime.datetime.now(datetime.timezone.utc) - started).total_seconds() * 1000
-                import asyncio
-                cancelled = isinstance(exc, asyncio.CancelledError)
+                # The raw exception class name; the server decides whether it
+                # was a failure or a cancellation.
                 emit_lifecycle(
                     entity_type="trace",
                     entity_id=tid,
-                    lifecycle="cancelled" if cancelled else "failed",
+                    lifecycle="failed",
                     context=child_context,
                     trace_id=tid,
                     trace_name=trace_name,
                     started_at=started_at,
                     ended_at=ended_at,
                     duration_ms=elapsed,
-                    error_type=None if cancelled else type(exc).__name__,
+                    error_type=type(exc).__name__,
                 )
                 raise
             else:
@@ -630,12 +580,10 @@ def start_execution(
             except BaseException as exc:
                 ended_at = _iso_timestamp()
                 elapsed = (datetime.datetime.now(datetime.timezone.utc) - started).total_seconds() * 1000
-                import asyncio
-                cancelled = isinstance(exc, asyncio.CancelledError)
                 emit_lifecycle(
                     entity_type="execution",
                     entity_id=eid,
-                    lifecycle="cancelled" if cancelled else "failed",
+                    lifecycle="failed",
                     context=child_context,
                     execution_id=eid,
                     group_name=stable_group,
@@ -644,7 +592,7 @@ def start_execution(
                     started_at=started_at,
                     ended_at=ended_at,
                     duration_ms=elapsed,
-                    error_type=None if cancelled else type(exc).__name__,
+                    error_type=type(exc).__name__,
                     expected_items=expected_items,
                     completed_items=completed_items,
                     failed_items=failed_items,
@@ -697,6 +645,14 @@ class SpanHandle:
         self._output = value
 
 
+def _span_call_site() -> Any:
+    from costkey.stack import capture_call_site
+    try:
+        return capture_call_site()
+    except Exception:
+        return None
+
+
 class _SpanScope:
     """A span usable as ``with``, ``async with`` or a (sync/async) decorator.
 
@@ -715,6 +671,8 @@ class _SpanScope:
         span_id: str | None = None,
         parent_span_id: str | None = None,
         context: Mapping[str, Any] | None = None,
+        detached: bool = False,
+        framework: str | None = None,
     ) -> None:
         if not isinstance(name, str) or not name.strip():
             raise ValueError("span name is required")
@@ -725,6 +683,13 @@ class _SpanScope:
         self.span_id = span_id
         self.parent_span_id = parent_span_id
         self.context = dict(context or {})
+        # A detached span is recorded without becoming the active span of the
+        # current context (for spans owned by another tracer, e.g. OTel).
+        self.detached = detached
+        # Integrations pass their framework's raw attributes; they are sent
+        # under ``attributes.<framework>`` (see ``framework_attributes``).
+        self.framework = framework
+        self._owns_trace = False
         self._trace_cm: Any = None
         self._token: Any = None
         self._previous: dict[str, Any] | None = None
@@ -736,22 +701,39 @@ class _SpanScope:
         return _SpanScope(
             self.name, self.kind, attributes=self.attributes, input=self.input,
             span_id=self.span_id, parent_span_id=self.parent_span_id, context=self.context,
+            detached=self.detached, framework=self.framework,
         )
 
+    def _wire_attributes(self, values: Mapping[str, Any]) -> dict[str, Any]:
+        if self.framework:
+            from costkey.patch import framework_attributes
+            return framework_attributes(self.framework, dict(values))
+        return dict(values)
+
     def __enter__(self) -> SpanHandle:
-        if not _current_context().get("traceId"):
+        has_trace = bool(self.context.get("traceId") or _current_context().get("traceId"))
+        if not has_trace and not self.detached:
             self._trace_cm = start_trace(name=self.name)
             self._trace_cm.__enter__()
         ctx = get_context()
         sid = self.span_id or f"sp_{uuid.uuid4().hex}"
         inherited = ctx.get("spanId") if ctx.get("spanId") != sid else None
         child = {**ctx, **_canonical_context(self.context), "spanId": sid}
+        if self.detached and not has_trace:
+            # No trace to join: this span starts one without touching the
+            # context (the lifecycle events are emitted by hand).
+            child["traceId"] = uuid.uuid4().hex
+            child["traceName"] = self.name
+            self._owns_trace = True
         if self.kind == "agent":
             child["agent"] = self.name
         if self.kind == "tool":
             child["tool"] = self.name
-        self._previous = _context.get()
-        self._token = _context.set(child)
+        if not self.detached:
+            self._previous = _context.get()
+            self._token = _context.set(child)
+        from costkey.patch import _span_opened
+        _span_opened(sid)
         handle = SpanHandle(sid, str(child.get("traceId")))
         handle._attributes.update(self.attributes)
         self._handle = handle
@@ -766,20 +748,43 @@ class _SpanScope:
             "name": self.name,
             "started_at": _iso_timestamp(self._started),
             "context": child,
+            # Where the span was opened, raw; the server attributes calls made
+            # inside it with no code of their own (a framework's task) to it.
+            "call_site": _span_call_site(),
         }
+        if self._owns_trace:
+            self._emit_trace("started")
         try:
-            emit_span(**self._base, status="running", attributes=dict(handle._attributes), input=self.input)
+            emit_span(**self._base, status="running", attributes=self._wire_attributes(handle._attributes),
+                      input=self.input)
         except Exception:
             logger.debug("[costkey] span start dropped", exc_info=True)
         return handle
 
+    def _emit_trace(self, lifecycle: str, error: str | None = None) -> None:
+        trace_id = self._base.get("trace_id")
+        try:
+            ended = None if lifecycle == "started" else _iso_timestamp()
+            emit_lifecycle(
+                entity_type="trace", entity_id=str(trace_id), lifecycle=lifecycle,
+                context=dict(self._base.get("context") or {}), trace_id=str(trace_id),
+                trace_name=self._base.get("trace_name"), started_at=self._base.get("started_at"),
+                ended_at=ended,
+                duration_ms=(
+                    (datetime.datetime.now(datetime.timezone.utc) - self._started).total_seconds() * 1000
+                    if ended and self._started else None
+                ),
+                error_type=error,
+            )
+        except Exception:
+            logger.debug("[costkey] trace lifecycle dropped", exc_info=True)
+
     def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> bool:
         try:
-            import asyncio
+            # The raw exception class name (CancelledError included); the
+            # server maps it to failed or cancelled.
             if exc_type is None:
                 status, error = "ok", None
-            elif issubclass(exc_type, asyncio.CancelledError):
-                status, error = "cancelled", None
             else:
                 status, error = "error", exc_type.__name__
             ended = datetime.datetime.now(datetime.timezone.utc)
@@ -790,20 +795,35 @@ class _SpanScope:
                 ended_at=_iso_timestamp(ended),
                 duration_ms=(ended - (self._started or ended)).total_seconds() * 1000,
                 error_type=error,
-                attributes=dict(handle._attributes) if handle else None,
+                attributes=self._wire_attributes(handle._attributes) if handle else None,
                 output=handle._output if handle else None,
             )
         except Exception:
             logger.debug("[costkey] span end dropped", exc_info=True)
         finally:
-            try:
-                _context.reset(self._token)
-            except ValueError:
-                # Closed from a different context (e.g. framework hooks): restore by value.
-                _context.set(self._previous or {})
-            if self._trace_cm is not None:
-                self._trace_cm.__exit__(exc_type, exc, tb)
+            from costkey.patch import _span_closed
+            _span_closed(self._base.get("span_id"))
+            if self._owns_trace:
+                self._owns_trace = False
+                self._emit_trace("completed" if exc_type is None else "failed",
+                                 None if exc_type is None else exc_type.__name__)
+            if not self.detached:
+                self._restore_context(exc_type, exc, tb)
         return False
+
+    def _restore_context(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        try:
+            _context.reset(self._token)
+        except ValueError:
+            # Closed from a different context (e.g. framework hooks): restore by value.
+            _context.set(self._previous or {})
+        if self._trace_cm is not None:
+            trace_cm, self._trace_cm = self._trace_cm, None
+            try:
+                trace_cm.__exit__(exc_type, exc, tb)
+            except ValueError:
+                # The trace scope was opened in another context.
+                _context.set(self._previous or {})
 
     async def __aenter__(self) -> SpanHandle:
         return self.__enter__()
@@ -865,66 +885,6 @@ def tool(name: str, **options: Any) -> _SpanScope:
     return _span_scope(name, "tool", options)
 
 
-_MAX_SCORE_NAME_CHARS = 120
-_MAX_SCORE_LABEL_CHARS = 60
-_MAX_SCORE_COMMENT_CHARS = 1000
-_SCORE_SOURCES = frozenset({"judge", "human", "code"})
-
-
-def score(
-    name: str,
-    value: float,
-    *,
-    label: str | None = None,
-    comment: str | None = None,
-    source: str | None = None,
-    trace_id: str | None = None,
-    span_id: str | None = None,
-    id: str | None = None,
-    timestamp: Any = None,
-) -> None:
-    """Record a judge, human or code score on a run.
-
-    Inside a trace or span the score attaches to it; otherwise pass
-    ``trace_id``. Sending the same ``id`` again replaces the earlier score.
-    Invalid input raises ``ValueError``; before ``init`` the call is a no-op.
-    """
-    score_name = _non_empty(name)
-    if not score_name:
-        raise ValueError("costkey.score() requires a non-empty name")
-    if len(score_name) > _MAX_SCORE_NAME_CHARS:
-        raise ValueError(f"costkey.score() name must be at most {_MAX_SCORE_NAME_CHARS} characters")
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
-        raise ValueError("costkey.score() value must be a finite number")
-    score_label = _non_empty(label)
-    if score_label and len(score_label) > _MAX_SCORE_LABEL_CHARS:
-        raise ValueError(f"costkey.score() label must be at most {_MAX_SCORE_LABEL_CHARS} characters")
-    if source is not None and source not in _SCORE_SOURCES:
-        raise ValueError("costkey.score() source must be judge, human or code")
-    current = _current_context()
-    explicit_trace = _non_empty(trace_id)
-    resolved_trace = explicit_trace or _non_empty(current.get("traceId"))
-    # A score for another run never inherits the current span.
-    resolved_span = _non_empty(span_id) or (None if explicit_trace else _non_empty(current.get("spanId")))
-    if not resolved_trace and not resolved_span:
-        raise ValueError("costkey.score() needs a run: call it inside a trace or span, or pass trace_id")
-    score_comment = _non_empty(comment)
-    from costkey.patch import _state
-    if not _state.transport or not _state.project_id:
-        return
-    emit_score(
-        score_id=_non_empty(id) or f"sc_{uuid.uuid4().hex}",
-        name=score_name,
-        value=float(value),
-        timestamp=_iso_timestamp(timestamp),
-        trace_id=resolved_trace,
-        span_id=resolved_span,
-        label=score_label,
-        comment=score_comment[:_MAX_SCORE_COMMENT_CHARS] if score_comment else None,
-        source=source,
-    )
-
-
 def export_context(*, keys: set[str] | list[str] | tuple[str, ...] | None = None) -> dict[str, Any]:
     """Return an explicit, allowlisted carrier for trusted handoff only."""
     current = get_context()
@@ -979,7 +939,7 @@ def record_usage(
     event_id: str | None = None,
     component_id: str | None = None,
     charge_id: str | None = None,
-    provider: Any = "unknown",
+    provider: Any = None,
     model: str | None = None,
     unit: str | None = None,
     usage: Mapping[str, Any] | Any = None,
@@ -1003,11 +963,12 @@ def record_usage(
     attempt_id: str | None = None,
     parent_event_id: str | None = None,
 ) -> str:
-    """Report one external usage component with explicit revision semantics.
+    """Report one external usage component exactly as the caller describes it.
 
-    The caller supplies a unique envelope ``event_id`` and a revision. Delta
-    revisions are additive downstream; cumulative revisions are full snapshots
-    and are never converted to deltas in the SDK.
+    The SDK sends what you pass: no defaults are filled in and nothing is
+    derived. Dedup, revision fences, charge ids, currency and pricing are the
+    server's job. ``event_id``, ``component_id`` and a non-negative integer
+    ``revision`` are required because the server rejects usage without them.
     """
     values = dict(event or {})
     # Mapping input is a migration seam for callers that already construct a
@@ -1015,19 +976,13 @@ def record_usage(
     event_id = event_id or id or values.pop("id", None) or values.pop("eventId", None) or values.pop("event_id", None)
     component_id = component_id or values.pop("componentId", None) or values.pop("component_id", None) or values.pop("component", None)
     charge_id = charge_id or values.pop("chargeId", None) or values.pop("charge_id", None)
-    provider = provider if provider != "unknown" else values.pop("provider", provider)
+    provider = provider if provider is not None else values.pop("provider", None)
     model = model or values.pop("model", None)
-    unit = unit or values.pop("unit", None) or values.pop("unitKind", None)
+    unit = unit or values.pop("unit", None)
     usage = usage if usage is not None else values.pop("usage", values.pop("nativeUsage", None))
     native_units = native_units or values.pop("nativeUnits", None) or values.pop("native_units", None)
     amount = amount if amount is not None else values.pop("amount", None)
-    if amount is None:
-        amount = values.pop("cost", None)
-    if amount is None:
-        amount = values.pop("costUsd", values.pop("cost_usd", None))
     cost_usd = cost_usd if cost_usd is not None else values.pop("costUsd", values.pop("cost_usd", None))
-    if amount is None and cost_usd is not None:
-        amount = cost_usd
     currency = currency or values.pop("currency", None)
     amount_kind = amount_kind or values.pop("amountKind", None) or values.pop("amount_kind", None)
     pricing_id = pricing_id or values.pop("pricingId", None) or values.pop("pricing_id", None)
@@ -1045,13 +1000,6 @@ def record_usage(
     attempt_id = attempt_id or values.pop("attemptId", None) or values.pop("attempt_id", None)
     parent_event_id = parent_event_id or values.pop("parentEventId", None) or values.pop("parent_event_id", None)
 
-    unit = _non_empty(unit)
-    unit_kind = _non_empty(unit_kind)
-    pricing_id = _non_empty(pricing_id)
-    provider_request_id = _non_empty(provider_request_id)
-    attempt_id = _non_empty(attempt_id)
-    parent_event_id = _non_empty(parent_event_id)
-
     event_id = _non_empty(event_id)
     component_id = _non_empty(component_id)
     if not event_id:
@@ -1062,31 +1010,11 @@ def record_usage(
         raise ValueError("record_usage requires a non-negative integer revision")
     if aggregation not in {"delta", "cumulative"}:
         raise ValueError("aggregation must be 'delta' or 'cumulative'")
-    if charge_id is None:
-        charge_id = component_id
-    charge_id = _non_empty(charge_id)
-    if not charge_id:
-        raise ValueError("charge_id must be a non-empty string")
 
-    usage_data = _usage_payload(usage, native_units)
-    amount_data, cost_usd, amount_currency = _amount_payload(amount, currency)
-    billing_data = _usage_payload(billing_units) if billing_units is not None else None
-    provider_name = _non_empty(getattr(provider, "value", provider)) or "unknown"
-    if amount_kind is None and amount_data is not None:
-        amount_kind = "reported"
-    if amount_kind is not None and amount_kind not in {"reported", "estimated"}:
-        raise ValueError("amount_kind must be 'reported' or 'estimated'")
-    if unit_kind is not None and (not isinstance(unit_kind, str) or not unit_kind):
-        raise ValueError("unit_kind must be a non-empty string")
-    if unit_value is not None and (
-        not isinstance(unit_value, (int, float))
-        or isinstance(unit_value, bool)
-        or not math.isfinite(unit_value)
-        or unit_value < 0
-    ):
-        raise TypeError("unit_value must be a finite non-negative number")
-    if metadata is not None and not isinstance(metadata, Mapping):
-        raise TypeError("metadata must be a mapping")
+    usage_data = _caller_map(usage, "usage")
+    native_data = _caller_map(native_units, "native_units")
+    if native_data:
+        usage_data = {**(usage_data or {}), **native_data}
     event_context = {
         **_current_context(),
         **_canonical_context(context),
@@ -1096,89 +1024,38 @@ def record_usage(
     if execution_id is not None:
         event_context["executionId"] = execution_id
 
-    fingerprint = _fingerprint({
-        "componentId": component_id,
-        "chargeId": charge_id,
-        "provider": provider_name,
-        "model": model,
-        "unit": unit,
-        "usage": usage_data,
-        "amount": amount_data,
-        "currency": amount_currency,
-        "amountKind": amount_kind,
-        "pricingId": pricing_id,
-        "unitKind": unit_kind or unit,
-        "unitValue": unit_value,
-        "metadata": _scrub(_json_safe(metadata)) if isinstance(metadata, Mapping) else None,
-        "billingUnits": billing_data,
-        "providerRequestId": provider_request_id,
-        "attemptId": attempt_id,
-        "parentEventId": parent_event_id,
-        "aggregation": aggregation,
-        "revision": revision,
-    })
     project_id = _project_id()
     from costkey.patch import _state
     if not project_id or _state.transport is None:
-        # Match the SDK lifecycle: pre-init/test-mode usage is a validation
-        # no-op and must not poison the revision ledger used after init.
+        # Before init (or in test mode) usage is a validation-only no-op.
         return event_id
-    scope_key = (project_id, charge_id)
-    key = (project_id, charge_id, revision)
-    with _usage_lock:
-        previous_mode = _usage_modes.get(scope_key)
-        if previous_mode is not None and previous_mode != aggregation:
-            raise ValueError(f"charge_id {charge_id!r} cannot switch aggregation mode")
-        _usage_modes[scope_key] = aggregation
-        previous_fingerprint = _usage_updates.get(key)
-        if previous_fingerprint is not None:
-            if previous_fingerprint != fingerprint:
-                raise ValueError(f"conflicting usage update for charge_id={charge_id!r}, revision={revision}")
-            _usage_event_ids[event_id] = fingerprint
-            return event_id
-        previous_event = _usage_event_ids.get(event_id)
-        if previous_event is not None and previous_event != fingerprint:
-            raise ValueError(f"conflicting usage event_id {event_id!r}")
-        if aggregation == "cumulative":
-            prior_revisions = [
-                previous_revision
-                for (previous_project, previous_charge, previous_revision) in _usage_updates
-                if previous_project == project_id and previous_charge == charge_id
-            ]
-            if prior_revisions and revision < max(prior_revisions):
-                # An older full snapshot cannot safely be applied after a
-                # newer one. Return its ID without emitting it.
-                _usage_event_ids[event_id] = fingerprint
-                return event_id
-        _usage_updates[key] = fingerprint
-        _usage_event_ids[event_id] = fingerprint
 
+    provider_value = getattr(provider, "value", provider)
     explicit_event = CostKeyEvent(
         id=event_id,
         timestamp=_iso_timestamp(timestamp),
         project_id=project_id,
-        provider=provider_name,
+        provider=str(provider_value) if provider_value is not None else "unknown",
         model=model,
-        usage=None,
-        cost_usd=cost_usd,
+        cost_usd=_json_safe(cost_usd),
         context=_scrub(event_context),
         trace_id=event_context.get("traceId"),
         trace_name=event_context.get("traceName"),
         event_type="usage",
         source="explicit",
         component_id=component_id,
-        charge_id=charge_id,
+        charge_id=_non_empty(charge_id),
         revision=revision,
         aggregation=aggregation,
         native_usage=usage_data,
-        billing_units=billing_data,
-        amount=amount_data,
-        currency=amount_currency,
+        billing_units=_caller_map(billing_units, "billing_units"),
+        amount=_json_safe(amount),
+        currency=currency,
         amount_kind=amount_kind,
         pricing_id=pricing_id,
         unit=unit,
-        unit_kind=unit_kind or unit,
-        unit_value=unit_value,
+        unit_kind=unit_kind,
+        unit_value=_json_safe(unit_value),
         execution_id=event_context.get("executionId"),
         group_id=event_context.get("groupId"),
         group_name=event_context.get("groupName"),
@@ -1208,13 +1085,3 @@ get_current_context = get_context
 def get_runtime_config_status() -> str:
     from costkey.patch import runtime_config_status
     return runtime_config_status()
-
-
-def register_extractor(extractor: Any) -> None:
-    """Register a custom provider extractor."""
-    _register_extractor(extractor)
-
-
-def register_pricing(model: str, input_per_1m: float, output_per_1m: float, **kwargs: Any) -> None:
-    """Register custom model pricing."""
-    _register_pricing(model, input_per_1m, output_per_1m, **kwargs)

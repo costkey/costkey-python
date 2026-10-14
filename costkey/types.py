@@ -1,7 +1,7 @@
 from __future__ import annotations
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Callable, Optional
+from typing import Any, Callable
 
 
 class Provider(str, Enum):
@@ -58,47 +58,20 @@ class Provider(str, Enum):
 
 
 @dataclass
-class NormalizedUsage:
-    input_tokens: int | None = None
-    output_tokens: int | None = None
-    total_tokens: int | None = None
-    reasoning_tokens: int | None = None
-    cache_read_tokens: int | None = None
-    cache_creation_tokens: int | None = None
-    # Provider-native units which cannot be reduced to tokens (for example
-    # audio seconds, characters, images, or requests).  Keep these separate
-    # instead of inventing a cross-modality total.
-    native_units: dict[str, int | float | None] = field(default_factory=dict)
-    # Some providers (notably routers) return their own amount.  Preserve the
-    # amount as reported; the server remains authoritative for estimates.
-    cost_usd: float | None = None
-    image_output_tokens: int | None = None
-
-    @property
-    def units(self) -> dict[str, int | float | None]:
-        """Compatibility alias for callers that call native units ``units``."""
-        return self.native_units
-
-
-@dataclass
 class StackFrame:
     function_name: str | None = None
     file_name: str | None = None
     line_number: int | None = None
+    # Source context, only for in-app frames whose file could be read.
+    context_line: str | None = None
+    pre_context: list[str] | None = None
+    post_context: list[str] | None = None
 
 
 @dataclass
 class CallSite:
     raw: str = ""
     frames: list[StackFrame] = field(default_factory=list)
-
-
-@dataclass
-class StreamTiming:
-    ttft: float | None = None
-    tps: float | None = None
-    stream_duration: float | None = None
-    chunk_count: int = 0
 
 
 @dataclass
@@ -111,17 +84,17 @@ class CostKeyEvent:
     url: str = ""
     method: str = "POST"
     status_code: int | None = None
-    usage: NormalizedUsage | None = None
     cost_usd: float | None = None
     duration_ms: float = 0
     streaming: bool = False
-    stream_timing: StreamTiming | None = None
     call_site: CallSite | None = None
     context: dict[str, Any] = field(default_factory=dict)
     metadata: dict[str, Any] | None = None
-    system_prompt: str | None = None
+    # Opt-in content capture (project setting): the scrubbed provider bodies.
     request_body: Any = None
     response_body: Any = None
+    # Raw telemetry (contract v1). Present on every captured call.
+    telemetry: dict[str, Any] | None = None
     # Additive DevX event envelope fields.  Defaults preserve the legacy
     # provider-call shape and wire compatibility.
     event_type: str = "call"
@@ -132,6 +105,7 @@ class CostKeyEvent:
     lifecycle: str | None = None
     started_at: str | None = None
     ended_at: str | None = None
+    # The raw exception class name; the server maps it to failed/cancelled.
     error_type: str | None = None
     expected_items: int | None = None
     completed_items: int | None = None
@@ -142,14 +116,13 @@ class CostKeyEvent:
     aggregation: str | None = None
     native_usage: dict[str, Any] | None = None
     billing_units: dict[str, Any] | None = None
-    amount: dict[str, Any] | None = None
+    amount: Any = None
     currency: str | None = None
     amount_kind: str | None = None
     pricing_id: str | None = None
     unit: str | None = None
     unit_kind: str | None = None
     unit_value: int | float | None = None
-    request_model: str | None = None
     attempt_id: str | None = None
     parent_event_id: str | None = None
     group_name: str | None = None
@@ -170,11 +143,6 @@ class CostKeyEvent:
     span_name: str | None = None
     span_status: str | None = None
     attributes: dict[str, Any] | None = None
-    # Judge/eval scores on a run (event_type == "score").
-    score_name: str | None = None
-    score_value: float | None = None
-    score_label: str | None = None
-    score_comment: str | None = None
 
 
 @dataclass

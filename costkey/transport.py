@@ -4,6 +4,7 @@ Enqueue is non-blocking; explicit flush/shutdown may wait for best-effort
 delivery at an application-owned lifecycle boundary.
 """
 from __future__ import annotations
+import gzip
 import json
 import time
 import threading
@@ -15,6 +16,16 @@ from costkey.types import CostKeyEvent
 from costkey.version import __version__
 
 logger = logging.getLogger("costkey")
+
+
+def _frame_dict(f: Any) -> dict[str, Any]:
+    d: dict[str, Any] = {"functionName": f.function_name, "fileName": f.file_name,
+                         "lineNumber": f.line_number, "columnNumber": None}
+    if getattr(f, "context_line", None) is not None:
+        d["contextLine"] = f.context_line
+        d["preContext"] = list(f.pre_context or [])
+        d["postContext"] = list(f.post_context or [])
+    return d
 
 
 def _sanitize_url(value: Any) -> str:
@@ -40,20 +51,51 @@ def _sanitize_url(value: Any) -> str:
         return ""
 
 MAX_QUEUE_SIZE = 500
+GZIP_MIN_BYTES = 1024
+# Serialized JSON per POST. The ingest server accepts up to 32 MB (Cloud Run
+# caps HTTP/1 requests at 32 MiB); batches stay well under that. A single
+# event larger than this still goes, alone.
+MAX_BATCH_BYTES = 8 * 1024 * 1024
 MAX_RETRIES = 10
 BASE_BACKOFF_S = 2.0
 MAX_BACKOFF_S = 60.0
 
 
+def _encode(value: Any) -> bytes:
+    return json.dumps(value, separators=(",", ":"), ensure_ascii=False, default=str).encode("utf-8")
+
+
+def _event_bytes(event: dict[str, Any]) -> int:
+    try:
+        return len(_encode(event))
+    except Exception:
+        return 0
+
+
+def _fit_bytes(events: list[dict[str, Any]], limit: int) -> list[dict[str, Any]]:
+    """The longest prefix of ``events`` whose serialized size stays within
+    ``limit``; always at least one event, so an oversized event goes alone."""
+    total = 0
+    for index, event in enumerate(events):
+        # +1 for the comma between events in the array.
+        total += _event_bytes(event) + (1 if index else 0)
+        if index and total > limit:
+            return events[:index]
+    return events
+
+
 class Transport:
     def __init__(self, endpoint: str, auth_key: str, max_batch_size: int,
-                 flush_interval: float, debug: bool, release: str | None = None):
+                 flush_interval: float, debug: bool, release: str | None = None,
+                 commit: str | None = None, repository: str | None = None):
         self._endpoint = endpoint
         self._auth_key = auth_key
         self._max_batch_size = max(1, int(max_batch_size))
         self._flush_interval = max(0.01, float(flush_interval))
         self._debug = debug
         self._release = release
+        self._commit = commit
+        self._repository = repository
         self._queue: list[dict[str, Any]] = []
         self._lock = threading.Lock()
         # One long-lived worker handles all automatic delivery.  Enqueue only
@@ -162,25 +204,55 @@ class Transport:
                         wait = round(self._backoff_until - now)
                         logger.warning(f"[costkey] Backing off, retry in {wait}s")
                     return None
-            batch = self._queue[:self._max_batch_size]
+            candidates = self._queue[:self._max_batch_size]
             self._queue = self._queue[self._max_batch_size:]
-            return batch
+        # Size the candidates outside the queue lock so a large body never
+        # blocks enqueue on a provider-call thread.
+        batch = _fit_bytes(candidates, MAX_BATCH_BYTES)
+        leftover = candidates[len(batch):]
+        if leftover:
+            with self._lock:
+                # Back at the front, in order; only the flush path takes, so
+                # nothing else was taken in between.
+                self._queue = (leftover + self._queue)[:MAX_QUEUE_SIZE]
+        return batch
 
     def _send_batch(self, batch: list[dict[str, Any]]) -> bool:
         payload: dict[str, Any] = {"sdkVersion": f"python-{__version__}", "events": batch}
         if self._release:
             payload["release"] = self._release
+        if self._commit:
+            payload["commit"] = self._commit
+        if self._repository:
+            payload["repository"] = self._repository
 
         try:
-            resp = httpx.post(
-                self._endpoint,
-                json=payload,
-                headers={
-                    "Authorization": f"Bearer {self._auth_key}",
-                    "User-Agent": f"costkey-python/{__version__}",
-                },
-                timeout=10,
-            )
+            body = _encode(payload)
+        except Exception as e:
+            # Unserializable events never succeed on retry; drop them.
+            logger.warning(f"[costkey] Dropped {len(batch)} events that could not be serialized: {e}")
+            return True
+
+        headers = {
+            "Authorization": f"Bearer {self._auth_key}",
+            "User-Agent": f"costkey-python/{__version__}",
+            "Content-Type": "application/json",
+        }
+        # Prompts compress well: gzip anything past a small batch.
+        if len(body) > GZIP_MIN_BYTES:
+            body = gzip.compress(body, compresslevel=6)
+            headers["Content-Encoding"] = "gzip"
+
+        try:
+            from costkey.patch import internal_http
+            with internal_http():
+                resp = httpx.post(
+                    self._endpoint,
+                    content=body,
+                    headers=headers,
+                    # Large captured bodies take longer to upload.
+                    timeout=httpx.Timeout(10, write=max(10.0, len(body) / (256 * 1024))),
+                )
             if resp.status_code in (401, 403):
                 # Auth failure — always log (not just debug)
                 logger.warning(f"[costkey] Authentication failed ({resp.status_code}). Check the DSN under Settings, Projects in your CostKey console")
@@ -260,38 +332,19 @@ class Transport:
             "costUsd": event.cost_usd,
             "durationMs": event.duration_ms,
             "streaming": event.streaming,
-            "streamTiming": {
-                "ttft": event.stream_timing.ttft,
-                "tps": event.stream_timing.tps,
-                "streamDuration": event.stream_timing.stream_duration,
-                "chunkCount": event.stream_timing.chunk_count,
-            } if event.stream_timing else None,
+            "streamTiming": None,
             "callSite": {
                 "raw": event.call_site.raw,
-                "frames": [
-                    {"functionName": f.function_name, "fileName": f.file_name,
-                     "lineNumber": f.line_number, "columnNumber": None}
-                    for f in event.call_site.frames
-                ],
+                "frames": [_frame_dict(f) for f in event.call_site.frames],
             } if event.call_site else None,
             "context": event.context,
             "metadata": event.metadata,
-            "systemPrompt": event.system_prompt,
+            "systemPrompt": None,
             "requestBody": event.request_body,
             "responseBody": event.response_body,
         }
-        if event.usage:
-            d["usage"] = {
-                "inputTokens": event.usage.input_tokens,
-                "outputTokens": event.usage.output_tokens,
-                "totalTokens": event.usage.total_tokens,
-                "reasoningTokens": event.usage.reasoning_tokens,
-                "cacheReadTokens": event.usage.cache_read_tokens,
-                "cacheCreationTokens": event.usage.cache_creation_tokens,
-                "nativeUnits": event.usage.native_units,
-                "costUsd": event.usage.cost_usd,
-                "imageOutputTokens": event.usage.image_output_tokens,
-            }
+        if event.telemetry is not None:
+            d["telemetry"] = event.telemetry
 
         # Promote standard identity fields so new servers can index them while
         # retaining the legacy context object used by older servers.
@@ -312,8 +365,6 @@ class Transport:
             if value is not None:
                 d[key] = value
 
-        if event.request_model is not None:
-            d["requestModel"] = event.request_model
         if event.provider_request_id is not None:
             d["providerRequestId"] = event.provider_request_id
         if event.attempt_id is not None:
@@ -330,13 +381,6 @@ class Transport:
                 d["parentSpanId"] = event.parent_span_id
             if event.attributes:
                 d["attributes"] = event.attributes
-        if event.event_type == "score":
-            d["name"] = event.score_name
-            d["value"] = event.score_value
-            if event.score_label is not None:
-                d["label"] = event.score_label
-            if event.score_comment is not None:
-                d["comment"] = event.score_comment
         if event.entity_type is not None:
             d["entityType"] = event.entity_type
         if event.entity_id is not None:
@@ -350,6 +394,9 @@ class Transport:
         if event.ended_at is not None:
             d["endedAt"] = event.ended_at
         if event.error_type is not None:
+            # Contract detail 7: the raw class name. ``errorType`` is the
+            # legacy alias older servers read.
+            d["errorName"] = event.error_type
             d["errorType"] = event.error_type
         if event.expected_items is not None:
             d["expectedItems"] = event.expected_items

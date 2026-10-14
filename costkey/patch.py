@@ -1,12 +1,15 @@
-"""Monkey-patch HTTP clients to intercept AI provider calls."""
+"""Patch HTTP clients to capture AI provider calls as raw telemetry.
+
+The SDK only sends telemetry: each captured call carries the request and
+response skeletons, headers, stream chunks, timing and the raw error name.
+Provider, model, usage and cost are derived on the server.
+"""
 from __future__ import annotations
 import asyncio
-import base64
 import json
 import datetime
 import io
 import math
-import struct
 import time
 import uuid
 import weakref
@@ -14,20 +17,40 @@ import re
 import logging
 import functools
 import inspect
+import itertools
 import threading
 from contextvars import ContextVar
 from typing import Any, Callable, Iterator, AsyncIterator
 from urllib.parse import parse_qsl, quote, urlsplit, urlunsplit
-from costkey.types import CostKeyEvent, NormalizedUsage, StreamTiming, Provider
-from costkey.providers import (
-    BedrockExtractor, call_model, call_usage, find_extractor, is_audio_response, merge_usage,
-)
+from costkey import telemetry as _telemetry
+from costkey.types import CostKeyEvent, Provider
+from costkey import providers as _providers
+from costkey.providers import match_provider
 from costkey.stack import capture_call_site
 from costkey.transport import Transport
 
 logger = logging.getLogger("costkey")
 
 _context: ContextVar[dict[str, Any]] = ContextVar("costkey_context", default={})
+# Set while the SDK makes its own requests (ingest, config, admission,
+# settlement, call graph) so they are never captured as provider calls.
+_internal: ContextVar[bool] = ContextVar("costkey_internal_request", default=False)
+
+
+class internal_http:
+    """``with internal_http():`` marks the SDK's own HTTP requests."""
+
+    def __enter__(self) -> None:
+        self._token = _internal.set(True)
+
+    def __exit__(self, *exc: Any) -> None:
+        _internal.reset(self._token)
+
+
+def _captured_provider(url: str) -> str | None:
+    if _internal.get():
+        return None
+    return match_provider(url)
 
 _SECRET_PATTERNS = [
     re.compile(r"^sk-[a-zA-Z0-9]{20,}$"),
@@ -53,45 +76,21 @@ _CONTEXT_HEADER = "x-costkey-context"
 _TRACE_ID_HEADER = "x-costkey-trace-id"
 _TRACE_NAME_HEADER = "x-costkey-trace-name"
 _CARRIER_HEADERS = frozenset({_CONTEXT_HEADER, _TRACE_ID_HEADER, _TRACE_NAME_HEADER})
-_EVENT_STREAM_TYPE = "application/vnd.amazon.eventstream"
-_BINARY_TYPES = ("audio/", "video/", "image/", "application/octet-stream")
 _BLOB_MIN_CHARS = 16_384
 _BASE64_BLOB = re.compile(r"(?:data:[\w/+.-]+;base64,)?[A-Za-z0-9+/=_-]+")
 _MULTIPART_FIELD = re.compile(
-    rb'content-disposition: form-data; name="([^"]+)"\r\n(?:[^\r\n]+\r\n)*\r\n(.{0,4096}?)\r\n--',
+    rb'content-disposition: form-data; name="([^"]+)"\r\n(?:[^\r\n]+\r\n)*\r\n(.*?)\r\n--',
     re.IGNORECASE | re.DOTALL,
 )
-
-
-def _content_type(headers: Any) -> str:
-    try:
-        return str(headers.get("content-type") or "").lower() if headers is not None else ""
-    except Exception:
-        return ""
-
-
-def _is_binary_response(headers: Any) -> bool:
-    """Audio/image bodies carry no usage; never buffer or JSON-parse them."""
-    return _content_type(headers).startswith(_BINARY_TYPES)
-
-
-def _reads_body(extractor: Any, url: str, headers: Any) -> bool:
-    """Whether a response may be read for usage: never audio, whether sent as
-    audio bytes or wrapped in JSON (base64 or hex)."""
-    return not _is_binary_response(headers) and not is_audio_response(extractor, url)
-
-
-def _is_event_stream(headers: Any, url: str) -> bool:
-    content_type = _content_type(headers)
-    if content_type:
-        return content_type.startswith(_EVENT_STREAM_TYPE)
-    path = urlsplit(url).path
-    return path.endswith("/invoke-with-response-stream") or path.endswith("/converse-stream")
+_STREAM_TYPES = ("text/event-stream", "application/x-ndjson", "application/vnd.amazon.eventstream")
 
 
 def _is_stream_response(headers: Any) -> bool:
-    content_type = _content_type(headers)
-    return content_type.startswith(("text/event-stream", "application/x-ndjson", _EVENT_STREAM_TYPE))
+    return _telemetry.content_type(headers).startswith(_STREAM_TYPES)
+
+
+def _is_binary_response(headers: Any) -> bool:
+    return _telemetry.is_binary_type(_telemetry.content_type(headers))
 
 
 def _json_safe(value: Any, depth: int = 0) -> Any:
@@ -211,6 +210,7 @@ def _scrub(obj: Any) -> Any:
     return obj
 
 
+
 def _safe_url(url: str) -> str:
     """Keep provider path while removing URL credentials, queries, and fragments."""
     try:
@@ -287,16 +287,20 @@ def _incoming_context(headers: Any) -> dict[str, Any]:
 
 def _strip_httpx_context_headers(request: Any) -> Any:
     try:
-        import httpx
         headers = {
             key: value for key, value in request.headers.items()
             if key.lower() not in {_CONTEXT_HEADER, _TRACE_ID_HEADER, _TRACE_NAME_HEADER}
         }
-        return httpx.Request(
+        content = request.content
+        injected = _providers.inject_stream_usage_bytes(str(request.url), content)
+        if injected is not content:
+            content = injected
+            headers = {key: value for key, value in headers.items() if key.lower() != "content-length"}
+        return type(request)(
             request.method,
             request.url,
             headers=headers,
-            content=request.content,
+            content=content,
             extensions=request.extensions,
         )
     except Exception:
@@ -318,6 +322,11 @@ def _strip_requests_context_headers(request: Any) -> Any:
             key: value for key, value in request.headers.items()
             if key.lower() not in {_CONTEXT_HEADER, _TRACE_ID_HEADER, _TRACE_NAME_HEADER}
         }
+        body = getattr(request, "body", None)
+        injected = _providers.inject_stream_usage_bytes(str(getattr(request, "url", "")), body)
+        if injected is not body:
+            cleaned.body = injected
+            cleaned.headers["Content-Length"] = str(len(injected.encode("utf-8") if isinstance(injected, str) else injected))
         return cleaned
     except Exception:
         try:
@@ -328,225 +337,6 @@ def _strip_requests_context_headers(request: Any) -> Any:
         return request
 
 
-def _text_from_content(content: Any) -> str | None:
-    if isinstance(content, str):
-        return content
-    if not isinstance(content, list):
-        return None
-    parts: list[str] = []
-    for part in content:
-        if isinstance(part, str):
-            parts.append(part)
-        elif isinstance(part, dict) and isinstance(part.get("text"), str):
-            parts.append(part["text"])
-    return "\n".join(parts) if parts else None
-
-
-def _extract_system_prompt(body: Any) -> str | None:
-    if not isinstance(body, dict):
-        return None
-
-    direct = _text_from_content(
-        body.get("system") or body.get("system_prompt") or body.get("systemPrompt")
-    )
-    if direct:
-        return direct
-
-    system_instruction = body.get("system_instruction") or body.get("systemInstruction")
-    if isinstance(system_instruction, dict):
-        from_parts = _text_from_content(system_instruction.get("parts"))
-        if from_parts:
-            return from_parts
-
-    messages = body.get("messages")
-    if isinstance(messages, list):
-        prompts = []
-        for message in messages:
-            if not isinstance(message, dict):
-                continue
-            if message.get("role") not in ("system", "developer"):
-                continue
-            content = _text_from_content(message.get("content"))
-            if content:
-                prompts.append(content)
-        if prompts:
-            return "\n\n".join(prompts)
-
-    return None
-
-
-def _collect_tool_results(messages: Any) -> list[Any]:
-    if not isinstance(messages, list):
-        return []
-    results: list[Any] = []
-    for message in messages:
-        if not isinstance(message, dict):
-            continue
-        if message.get("role") in ("tool", "function"):
-            results.append(message)
-        content = message.get("content")
-        if isinstance(content, list):
-            results.extend(
-                block for block in content
-                if isinstance(block, dict) and block.get("type") == "tool_result"
-            )
-    return results
-
-
-def _collect_response_items(response_body: Any) -> tuple[list[Any], list[Any], list[Any]]:
-    tool_calls: list[Any] = []
-    web_searches: list[Any] = []
-    citations: list[Any] = []
-    if not isinstance(response_body, dict):
-        return tool_calls, web_searches, citations
-
-    choices = response_body.get("choices")
-    if isinstance(choices, list):
-        for choice in choices:
-            if not isinstance(choice, dict) or not isinstance(choice.get("message"), dict):
-                continue
-            message = choice["message"]
-            if isinstance(message.get("tool_calls"), list):
-                tool_calls.extend(message["tool_calls"])
-            if message.get("function_call"):
-                tool_calls.append(message["function_call"])
-            if isinstance(message.get("annotations"), list):
-                citations.extend(message["annotations"])
-
-    output = response_body.get("output")
-    if isinstance(output, list):
-        for item in output:
-            if not isinstance(item, dict):
-                continue
-            item_type = str(item.get("type", ""))
-            if "function_call" in item_type or "tool_call" in item_type:
-                tool_calls.append(item)
-            if "web_search" in item_type:
-                web_searches.append(item)
-            if isinstance(item.get("content"), list):
-                for content in item["content"]:
-                    if isinstance(content, dict) and isinstance(content.get("annotations"), list):
-                        citations.extend(content["annotations"])
-
-    content = response_body.get("content")
-    if isinstance(content, list):
-        for block in content:
-            if not isinstance(block, dict):
-                continue
-            if block.get("type") == "tool_use":
-                tool_calls.append(block)
-            if isinstance(block.get("citations"), list):
-                citations.extend(block["citations"])
-
-    function_calls = response_body.get("functionCalls") or response_body.get("function_calls")
-    if isinstance(function_calls, list):
-        tool_calls.extend(function_calls)
-
-    candidates = response_body.get("candidates")
-    if isinstance(candidates, list):
-        for candidate in candidates:
-            if not isinstance(candidate, dict):
-                continue
-            grounding = candidate.get("groundingMetadata") or candidate.get("grounding_metadata")
-            if grounding:
-                web_searches.append(grounding)
-
-    usage = response_body.get("usage")
-    if isinstance(usage, dict) and usage.get("server_tool_use"):
-        web_searches.append({"usage": usage["server_tool_use"]})
-
-    return tool_calls, web_searches, citations
-
-
-def _extract_metadata(request_body: Any, response_body: Any) -> dict[str, Any] | None:
-    if not isinstance(request_body, dict) and not isinstance(response_body, dict):
-        return None
-    req = request_body if isinstance(request_body, dict) else {}
-    metadata: dict[str, Any] = {}
-
-    messages = req.get("messages")
-    if isinstance(messages, list):
-        metadata["prompts"] = [
-            {
-                "role": str(message.get("role", "unknown")) if isinstance(message, dict) else "unknown",
-                "content": message.get("content") if isinstance(message, dict) else message,
-            }
-            for message in messages
-        ]
-    elif isinstance(req.get("contents"), list):
-        metadata["prompts"] = [
-            {
-                "role": str(content.get("role", "user")) if isinstance(content, dict) else "user",
-                "content": content,
-            }
-            for content in req["contents"]
-        ]
-    elif "input" in req:
-        metadata["prompts"] = [{"role": "input", "content": req["input"]}]
-
-    if isinstance(req.get("tools"), list) and req["tools"]:
-        metadata["toolDefinitions"] = req["tools"]
-    if "tool_choice" in req or "toolChoice" in req:
-        metadata["toolChoice"] = req.get("tool_choice", req.get("toolChoice"))
-
-    tool_calls, web_searches, citations = _collect_response_items(response_body)
-    tool_results = _collect_tool_results(messages)
-    if tool_calls:
-        metadata["toolCalls"] = tool_calls
-    if tool_results:
-        metadata["toolResults"] = tool_results
-    if web_searches:
-        metadata["webSearches"] = web_searches
-    if citations:
-        metadata["citations"] = citations
-
-    return metadata or None
-
-
-def _extract_safe_metadata(request_body: Any, response_body: Any) -> dict[str, Any] | None:
-    """Return structural metadata without copying provider content.
-
-    Metadata-only projects still benefit from coverage/debugging facts such as
-    message counts and response shape.  Deliberately avoid arbitrary role/type
-    values and all message/tool contents: malformed provider payloads can put
-    user data in those fields too.
-    """
-    request = request_body if isinstance(request_body, dict) else {}
-    response = response_body if isinstance(response_body, dict) else {}
-    summary: dict[str, Any] = {}
-
-    messages = request.get("messages")
-    if isinstance(messages, list):
-        summary["promptCount"] = len(messages)
-        summary["promptRoles"] = [
-            message.get("role")
-            if isinstance(message, dict)
-            and message.get("role") in {"system", "developer", "user", "assistant", "tool", "function"}
-            else "unknown"
-            for message in messages
-        ]
-    elif isinstance(request.get("contents"), list):
-        summary["promptCount"] = len(request["contents"])
-    elif "input" in request and request.get("input") is not None:
-        summary["promptCount"] = 1
-
-    tools = request.get("tools")
-    if isinstance(tools, list):
-        summary["toolDefinitionCount"] = len(tools)
-    if "tool_choice" in request or "toolChoice" in request:
-        summary["hasToolChoice"] = True
-
-    for key, result_key in (
-        ("choices", "choiceCount"),
-        ("output", "outputItemCount"),
-        ("content", "responseContentCount"),
-        ("candidates", "candidateCount"),
-    ):
-        value = response.get(key)
-        if isinstance(value, list):
-            summary[result_key] = len(value)
-
-    return {"raw": summary} if summary else None
 
 
 class _PatchState:
@@ -566,8 +356,9 @@ class _PatchState:
         self.debug: bool = False
         self.admission: Any = None
         self.admission_mode: str = "monitor"
-        self._original_httpx_send: Any = None
-        self._original_httpx_async_send: Any = None
+        # httpx and httpx2 (openai 3.x, anthropic 1.x and mistralai 3.x use httpx2):
+        # module name -> (Client.send, AsyncClient.send) before patching.
+        self._original_httpx: dict[str, tuple[Any, Any]] = {}
         self._original_requests_send: Any = None
         self._original_aiohttp_request: Any = None
         self._original_botocore_call: Any = None
@@ -631,8 +422,8 @@ def unpatch() -> None:
     _state.config_status = "unknown"
     _state.redaction_enabled = True
     try:
-        from costkey.providers import clear_runtime_providers
-        clear_runtime_providers()
+        from costkey.providers import clear_runtime_hosts
+        clear_runtime_hosts()
     except Exception:
         pass
 
@@ -658,8 +449,8 @@ def apply_runtime_config(config: Any, *, project_id: str | None = None) -> bool:
     _state.capture_body = _state.local_capture_body is not False and remote_allows_body
     _state.redaction_enabled = redaction_enabled
     try:
-        from costkey.providers import apply_runtime_providers
-        apply_runtime_providers(config.get("providers", []))
+        from costkey.providers import apply_runtime_hosts
+        apply_runtime_hosts(config.get("providers", []))
     except Exception:
         # Configured provider enrichment must never affect provider traffic.
         if _state.debug:
@@ -677,8 +468,8 @@ def _mark_runtime_config(status: str, *, project_id: str | None = None) -> None:
     _state.capture_body = False
     _state.config_known = status == "revoked"
     try:
-        from costkey.providers import clear_runtime_providers
-        clear_runtime_providers()
+        from costkey.providers import clear_runtime_hosts
+        clear_runtime_hosts()
     except Exception:
         pass
 
@@ -731,11 +522,12 @@ def start_runtime_config_fetch(
             if not is_current() and _state.transport is not None:
                 return
             url = f"{base_url.rstrip('/')}/api/v1/projects/{quote(project_id, safe='')}/config"
-            response = httpx.get(
-                url,
-                headers={"Authorization": f"Bearer {auth_key}"},
-                timeout=5,
-            )
+            with internal_http():
+                response = httpx.get(
+                    url,
+                    headers={"Authorization": f"Bearer {auth_key}"},
+                    timeout=5,
+                )
             if not is_current() and _state.transport is not None:
                 return
             if response.status_code in {401, 403}:
@@ -766,6 +558,7 @@ def start_runtime_config_fetch(
     worker.start()
 
 
+
 _STREAM_PATH = re.compile(r"(:streamGenerateContent$|:streamRawPredict$|/invoke-with-response-stream$|/converse-stream$)")
 
 
@@ -784,224 +577,6 @@ def _is_streaming_request(request_body: Any, url: str | None = None) -> bool:
         except Exception:
             return False
     return False
-
-
-def _sse_bodies(text: str) -> list[dict[str, Any]]:
-    bodies: list[dict[str, Any]] = []
-    for raw in text.split("\n"):
-        line = raw.lstrip()
-        if not line.startswith("data:"):
-            continue
-        data = line[5:].strip()
-        if not data or data == "[DONE]":
-            continue
-        try:
-            parsed = json.loads(data)
-        except Exception:
-            continue
-        if isinstance(parsed, dict):
-            bodies.append(parsed)
-    return bodies
-
-
-def _ndjson_bodies(text: str) -> list[dict[str, Any]]:
-    bodies: list[dict[str, Any]] = []
-    for line in text.split("\n"):
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            parsed = json.loads(line)
-        except Exception:
-            continue
-        if isinstance(parsed, dict):
-            bodies.append(parsed)
-    return bodies
-
-
-def _stream_bodies_usage(bodies: list[dict[str, Any]], extractor: Any) -> NormalizedUsage | None:
-    merged: NormalizedUsage | None = None
-    for parsed in bodies:
-        for candidate in (parsed, parsed.get("response"), parsed.get("message")):
-            if not isinstance(candidate, dict):
-                continue
-            try:
-                usage = extractor.extract_usage(candidate)
-            except Exception:
-                usage = None
-            if usage:
-                merged = merge_usage(merged, usage)
-    stream_units = getattr(extractor, "extract_stream_units", None)
-    if callable(stream_units):
-        try:
-            units = stream_units(bodies)
-        except Exception:
-            units = None
-        if units:
-            merged = merged or NormalizedUsage()
-            merged.native_units = {**(merged.native_units or {}), **units}
-    if merged and merged.total_tokens is None and merged.input_tokens is not None and merged.output_tokens is not None:
-        merged.total_tokens = merged.input_tokens + merged.output_tokens
-    return merged
-
-
-def _extract_sse_usage(text: str, extractor: Any) -> NormalizedUsage | None:
-    """Merge usage across a whole SSE stream.
-
-    OpenAI chat reports usage in the final chunk, the Responses API under
-    ``response.completed``'s ``response``, Anthropic input in ``message_start``
-    and output in ``message_delta``, Gemini cumulatively on every chunk. Each
-    field keeps its largest reported value, which is correct for all of them.
-    """
-    return _stream_bodies_usage(_sse_bodies(text), extractor)
-
-
-
-def _extract_sse_model(text: str, request_body: Any, extractor: Any) -> str | None:
-    for line in text.split("\n"):
-        if not line.startswith("data: "):
-            continue
-        data = line[6:].strip()
-        if data == "[DONE]":
-            continue
-        try:
-            parsed = json.loads(data)
-            model = extractor.extract_model(request_body, parsed)
-            if model:
-                return model
-        except Exception:
-            continue
-    return None
-
-
-_EVENT_HEADER_SIZES = {2: 1, 3: 2, 4: 4, 5: 8, 8: 8, 9: 16}
-
-
-def _event_stream_headers(raw: bytes) -> dict[str, Any]:
-    headers: dict[str, Any] = {}
-    i = 0
-    while i < len(raw):
-        name_length = raw[i]
-        name = raw[i + 1:i + 1 + name_length].decode("utf-8", "replace")
-        i += 1 + name_length
-        kind = raw[i]
-        i += 1
-        if kind in (0, 1):
-            value: Any = kind == 0
-        elif kind in (6, 7):
-            (length,) = struct.unpack_from(">H", raw, i)
-            value = raw[i + 2:i + 2 + length]
-            i += 2 + length
-            if kind == 7:
-                value = value.decode("utf-8", "replace")
-        elif kind in _EVENT_HEADER_SIZES:
-            value = raw[i:i + _EVENT_HEADER_SIZES[kind]]
-            i += _EVENT_HEADER_SIZES[kind]
-        else:
-            break
-        headers[name] = value
-    return headers
-
-
-def _decode_event_stream(data: bytes) -> list[tuple[dict[str, Any], bytes]]:
-    """Split an AWS event stream into (headers, payload) messages.
-
-    Each message is [total length u32][headers length u32][prelude crc u32]
-    [headers][payload][message crc u32], big-endian.
-    """
-    messages: list[tuple[dict[str, Any], bytes]] = []
-    offset = 0
-    while offset + 16 <= len(data):
-        total, headers_length = struct.unpack_from(">II", data, offset)
-        end = offset + total
-        if total < 16 or end > len(data) or 16 + headers_length > total:
-            break
-        try:
-            headers = _event_stream_headers(data[offset + 12:offset + 12 + headers_length])
-        except Exception:
-            headers = {}
-        messages.append((headers, data[offset + 12 + headers_length:end - 4]))
-        offset = end
-    return messages
-
-
-def _bedrock_payload_usage(payload: Any, extractor: Any) -> NormalizedUsage | None:
-    """Usage in one Bedrock stream event: Converse ``metadata`` events, or
-    InvokeModel ``chunk`` events whose bytes hold the model's own JSON."""
-    if not isinstance(payload, dict):
-        return None
-    if isinstance(payload.get("chunk"), dict):
-        payload = payload["chunk"]
-    blob = payload.get("bytes")
-    if isinstance(blob, (str, bytes, bytearray)):
-        try:
-            payload = json.loads(base64.b64decode(blob) if isinstance(blob, str) else bytes(blob))
-        except Exception:
-            return None
-        if not isinstance(payload, dict):
-            return None
-    merged: NormalizedUsage | None = None
-    for candidate in (payload, payload.get("message"), payload.get("metadata")):
-        if not isinstance(candidate, dict):
-            continue
-        try:
-            usage = extractor.extract_usage(candidate)
-        except Exception:
-            usage = None
-        if usage:
-            merged = merge_usage(merged, usage)
-    return merged
-
-
-def _extract_event_stream_usage(data: bytes, extractor: Any) -> NormalizedUsage | None:
-    merged: NormalizedUsage | None = None
-    for headers, payload in _decode_event_stream(data):
-        if headers.get(":message-type", "event") != "event":
-            continue
-        try:
-            parsed = json.loads(payload)
-        except Exception:
-            continue
-        usage = _bedrock_payload_usage(parsed, extractor)
-        if usage:
-            merged = merge_usage(merged, usage)
-    return merged
-
-
-def _stream_summary(data: bytes, extractor: Any, url: str, request_body: Any, headers: Any
-                    ) -> tuple[NormalizedUsage | None, str | None, str | None, dict[str, Any] | None]:
-    """Usage, model, provider request id and (for a plain JSON body read
-    through a streaming API) the parsed body, from a whole streamed response."""
-    if _is_event_stream(headers, url):
-        return _extract_event_stream_usage(data, extractor), None, None, None
-    text = data.decode("utf-8", errors="replace")
-    bodies = _sse_bodies(text)
-    body = None
-    if not bodies:
-        # Gemini without alt=sse streams a single JSON array of chunks.
-        try:
-            parsed = json.loads(text)
-        except Exception:
-            parsed = None
-        body = parsed if isinstance(parsed, dict) else None
-        bodies = [item for item in (parsed if isinstance(parsed, list) else [parsed]) if isinstance(item, dict)]
-        if parsed is None:
-            # Newline-delimited JSON (Ollama's native streams).
-            bodies = _ndjson_bodies(text)
-    model = None
-    for item in bodies:
-        try:
-            model = extractor.extract_model(request_body, item)
-        except Exception:
-            model = None
-        if model:
-            break
-    request_id = next((
-        item[key] for item in bodies
-        for key in ("id", "request_id", "requestId", "response_id", "responseId")
-        if isinstance(item.get(key), str) and item[key]
-    ), None)
-    return _stream_bodies_usage(bodies, extractor), model, request_id, body
 
 
 def _policy_refusal(reason: str, details: dict[str, Any] | None = None) -> Exception:
@@ -1160,44 +735,6 @@ async def _run_admission_async(payload: dict[str, Any]) -> dict[str, Any] | None
         return None
 
 
-def _provider_value(provider: Any) -> str:
-    value = getattr(provider, "value", provider)
-    return str(value)
-
-
-def _estimate_request_usage(request_body: Any, raw_body: Any = None) -> dict[str, int]:
-    """Per-call bounds for enforced budgets.
-
-    Input is bounded by the request's byte size (a token is never smaller than
-    one byte of request text); output by the request's own max-token setting.
-    """
-    usage: dict[str, int] = {}
-    raw: bytes | None = None
-    if isinstance(raw_body, (bytes, bytearray)):
-        raw = bytes(raw_body)
-    elif isinstance(raw_body, str):
-        raw = raw_body.encode("utf-8")
-    elif request_body is not None:
-        try:
-            raw = json.dumps(request_body).encode("utf-8")
-        except Exception:
-            raw = None
-    if raw:
-        usage["maxInputTokens"] = len(raw)
-    if isinstance(request_body, dict):
-        generation = request_body.get("generationConfig") if isinstance(request_body.get("generationConfig"), dict) else {}
-        inference = request_body.get("inferenceConfig") if isinstance(request_body.get("inferenceConfig"), dict) else {}
-        for value in (
-            request_body.get("max_tokens"), request_body.get("max_completion_tokens"),
-            request_body.get("max_output_tokens"), generation.get("maxOutputTokens"),
-            inference.get("maxTokens"),
-        ):
-            if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
-                usage["maxOutputTokens"] = value
-                break
-    return usage
-
-
 def _safe_admission_context(ctx: dict[str, Any]) -> dict[str, Any]:
     return _scrub({
         key: scalar
@@ -1222,702 +759,6 @@ def _reservation_id(decision: dict[str, Any] | None) -> str | None:
     return None
 
 
-def _actual_usage(usage: NormalizedUsage | None) -> dict[str, int | float]:
-    if usage is None:
-        return {}
-    result: dict[str, int | float] = {}
-    for source, target in (
-        ("input_tokens", "inputTokens"),
-        ("output_tokens", "outputTokens"),
-        ("total_tokens", "totalTokens"),
-    ):
-        value = getattr(usage, source, None)
-        if isinstance(value, (int, float)) and not isinstance(value, bool):
-            result[target] = value
-    native = usage.native_units
-    for names, target in (
-        (("audioSeconds", "audio_seconds", "audio_duration"), "audioSeconds"),
-        (("characters", "characterCount", "characters_count"), "characters"),
-        (("images", "imageCount", "image_count"), "images"),
-    ):
-        for name in names:
-            value = native.get(name)
-            if isinstance(value, (int, float)) and not isinstance(value, bool):
-                result[target] = value
-                break
-    return result
-
-
-def _settlement_outcome(
-    decision: dict[str, Any] | None,
-    usage: NormalizedUsage | None,
-    status_code: int | None,
-) -> str:
-    if not (decision and _reservation_id(decision)):
-        return "unknown"
-    units = {
-        str(policy.get("unit"))
-        for policy in decision.get("policies", [])
-        if isinstance(policy, dict) and policy.get("result") == "allow"
-    }
-    if status_code is not None and 200 <= status_code < 300:
-        if "money" in units and (usage is None or usage.cost_usd is None):
-            return "unknown"
-        if "tokens" in units and _actual_usage(usage).get("totalTokens") is None:
-            return "unknown"
-        return "success"
-    if usage is not None and (usage.cost_usd is not None or _actual_usage(usage)):
-        return "failed"
-    return "unknown"
-
-
-def _settlement_payload(
-    decision: dict[str, Any] | None,
-    usage: NormalizedUsage | None,
-    status_code: int | None,
-    event_id: str,
-) -> dict[str, Any] | None:
-    reservation_id = _reservation_id(decision)
-    if not reservation_id:
-        return None
-    payload: dict[str, Any] = {
-        "projectId": _state.project_id,
-        "reservationId": reservation_id,
-        "settlementId": f"{event_id}:settlement",
-        "outcome": _settlement_outcome(decision, usage, status_code),
-        "providerAttempted": True,
-    }
-    if usage is not None:
-        actual = _actual_usage(usage)
-        if actual:
-            payload["actualUsage"] = actual
-        if usage.cost_usd is not None:
-            payload["actualCostUsd"] = usage.cost_usd
-    return payload
-
-
-def _settle_sync(
-    decision: dict[str, Any] | None,
-    usage: NormalizedUsage | None,
-    status_code: int | None,
-    event_id: str,
-) -> None:
-    payload = _settlement_payload(decision, usage, status_code, event_id)
-    if not payload:
-        return
-    settler = getattr(_state.admission, "settle", None)
-    if not callable(settler):
-        return
-    for attempt in range(2):
-        try:
-            settler(payload)
-            return
-        except Exception:
-            if attempt == 1 and _state.debug:
-                logger.warning("[costkey] policy settlement unavailable; reservation remains pending")
-
-
-async def _settle_async(
-    decision: dict[str, Any] | None,
-    usage: NormalizedUsage | None,
-    status_code: int | None,
-    event_id: str,
-) -> None:
-    payload = _settlement_payload(decision, usage, status_code, event_id)
-    if not payload:
-        return
-    settler = getattr(_state.admission, "settle", None)
-    if not callable(settler):
-        return
-    for attempt in range(2):
-        try:
-            if inspect.iscoroutinefunction(settler):
-                await settler(payload)
-            else:
-                import asyncio
-                await asyncio.to_thread(settler, payload)
-            return
-        except Exception:
-            if attempt == 1 and _state.debug:
-                logger.warning("[costkey] policy settlement unavailable; reservation remains pending")
-
-
-def _admission_payload(event_id: str, extractor: Any, url: str, request_body: Any,
-                       raw_body: Any, ctx: dict[str, Any], streaming: bool) -> dict[str, Any]:
-    return {
-        "id": event_id,
-        "admissionId": event_id,
-        "requestId": event_id,
-        "projectId": _state.project_id,
-        "provider": _provider_value(extractor.provider),
-        "model": call_model(extractor, url, request_body, None),
-        "context": _safe_admission_context(ctx),
-        # Admission deliberately receives metadata only; request
-        # bodies and credentials never leave the application here.
-        "usageBounds": _estimate_request_usage(request_body, raw_body),
-        "streaming": streaming,
-    }
-
-
-# ── Streamed responses ──
-
-class _StreamRecorder:
-    """Records one streamed provider response and emits its call event once.
-
-    Clients feed it the bytes (or typed events) the caller consumes; it emits
-    when the stream ends, or when the caller stops early and closes it.
-    """
-
-    def __init__(self, extractor: Any, url: str, method: str, request_body: Any,
-                 start: float, call_site: Any, ctx: dict[str, Any], *,
-                 status_code: int | None = None, headers: Any = None,
-                 event_id: str | None = None, admission_decision: dict[str, Any] | None = None,
-                 settlement_async: bool = False, capture_body: bool | None = None) -> None:
-        self.extractor = extractor
-        self.url = url
-        self.method = method
-        self.request_body = request_body
-        self.start = start
-        self.call_site = call_site
-        self.ctx = ctx
-        self.status_code = status_code
-        self.headers = headers
-        self.event_id = event_id
-        self.admission_decision = admission_decision
-        self.settlement_async = settlement_async
-        self.capture_body = capture_body
-        # Audio and other media carry no usage; count them, don't keep them.
-        self.buffering = (
-            _is_event_stream(headers, url) or not _is_binary_response(headers)
-        ) and not is_audio_response(extractor, url)
-        self.buffer = bytearray()
-        self.usage: NormalizedUsage | None = None
-        self.first_chunk_time: float | None = None
-        self.chunk_count = 0
-        # Client read methods call each other (iter_lines -> iter_text ->
-        # iter_bytes); only the outermost one records.
-        self.depth = 0
-        self.sent = False
-        self.settlement_task: Any = None
-
-    def chunk(self, data: Any) -> None:
-        if self.sent or not data:
-            return
-        self.chunk_count += 1
-        if self.first_chunk_time is None:
-            self.first_chunk_time = time.perf_counter()
-        if self.buffering:
-            try:
-                self.buffer += data.encode("utf-8") if isinstance(data, str) else data
-            except Exception:
-                pass
-
-    def line(self, data: Any) -> None:
-        # Line iterators strip the separator SSE parsing needs.
-        if isinstance(data, str):
-            self.chunk(data + "\n")
-        elif isinstance(data, (bytes, bytearray)):
-            self.chunk(bytes(data) + b"\n")
-
-    def observe(self, usage: NormalizedUsage | None) -> None:
-        """Typed stream events (botocore) report usage directly."""
-        if self.sent:
-            return
-        self.chunk_count += 1
-        if self.first_chunk_time is None:
-            self.first_chunk_time = time.perf_counter()
-        if usage:
-            self.usage = merge_usage(self.usage, usage)
-
-    def done(self) -> None:
-        if self.sent:
-            return
-        self.sent = True
-        try:
-            self._emit()
-        except Exception:
-            logger.debug("[costkey] stream capture failed", exc_info=True)
-
-    async def finish_async(self) -> None:
-        self.done()
-        if self.settlement_task is not None:
-            await self.settlement_task
-
-    def _emit(self) -> None:
-        end = time.perf_counter()
-        duration_ms = (end - self.start) * 1000
-        usage, model, provider_request_id, body = self.usage, None, None, None
-        if self.buffer:
-            streamed, model, provider_request_id, body = _stream_summary(
-                bytes(self.buffer), self.extractor, self.url, self.request_body, self.headers,
-            )
-            if streamed:
-                usage = merge_usage(usage, streamed)
-        called = call_usage(self.extractor, self.url, self.request_body, body,
-                            self.headers, self.status_code, self.method)
-        if called:
-            usage = merge_usage(usage, called)
-
-        ttft = ((self.first_chunk_time - self.start) * 1000) if self.first_chunk_time else None
-        tps = None
-        if usage and usage.output_tokens and self.first_chunk_time:
-            stream_secs = end - self.first_chunk_time
-            if stream_secs > 0:
-                tps = usage.output_tokens / stream_secs
-        stream_timing = StreamTiming(
-            ttft=round(ttft, 2) if ttft else None,
-            tps=round(tps, 2) if tps else None,
-            stream_duration=round(duration_ms, 2),
-            chunk_count=self.chunk_count,
-        )
-
-        _process(self.extractor, self.url, self.method, self.status_code,
-                 self.request_body, body, duration_ms,
-                 True, stream_timing, self.call_site, self.ctx, event_id=self.event_id,
-                 provider_request_id=provider_request_id,
-                 capture_body=self.capture_body, usage=usage, model=model,
-                 response_headers=self.headers)
-        event_id = self.event_id or uuid.uuid4().hex
-        if _reservation_id(self.admission_decision) is None:
-            return
-        if self.settlement_async:
-            try:
-                loop = asyncio.get_running_loop()
-            except RuntimeError:
-                loop = None
-            if loop is not None:
-                self.settlement_task = loop.create_task(_settle_async(
-                    self.admission_decision, usage, self.status_code, event_id,
-                ))
-                return
-        _settle_sync(self.admission_decision, usage, self.status_code, event_id)
-
-
-def _record_iter(recorder: _StreamRecorder, original: Any, record: Callable[[Any], None]) -> Any:
-    @functools.wraps(original)
-    def wrapped(*a: Any, **kw: Any) -> Iterator[Any]:
-        recorder.depth += 1
-        outer = recorder.depth == 1
-        try:
-            for item in original(*a, **kw):
-                if outer:
-                    record(item)
-                yield item
-        finally:
-            recorder.depth -= 1
-            if outer:
-                recorder.done()
-    return wrapped
-
-
-def _record_aiter(recorder: _StreamRecorder, original: Any, record: Callable[[Any], None]) -> Any:
-    @functools.wraps(original)
-    async def wrapped(*a: Any, **kw: Any) -> AsyncIterator[Any]:
-        recorder.depth += 1
-        outer = recorder.depth == 1
-        try:
-            async for item in original(*a, **kw):
-                if outer:
-                    record(item)
-                yield item
-        finally:
-            recorder.depth -= 1
-            if outer:
-                await recorder.finish_async()
-    return wrapped
-
-
-def _emit_when_collected(owner: Any, recorder: _StreamRecorder) -> None:
-    """A stream the caller drops without finishing or closing still reports."""
-    try:
-        weakref.finalize(owner, recorder.done).atexit = False
-    except TypeError:
-        pass
-
-
-# ── httpx patching ──
-
-def _patch_httpx() -> None:
-    try:
-        import httpx
-
-        _state._original_httpx_send = httpx.Client.send
-
-        def patched_send(self: Any, request: Any, **kwargs: Any) -> Any:
-            url = str(request.url)
-            extractor = find_extractor(url)
-
-            if not extractor:
-                return _state._original_httpx_send(self, request, **kwargs)
-
-            call_site = capture_call_site()
-            ctx = {**_state.default_context, **get_context()}
-            for key, value in _incoming_context(request.headers).items():
-                ctx.setdefault(key, value)
-            request_to_send = _strip_httpx_context_headers(request)
-            capture_body = _state.capture_body
-            start = time.perf_counter()
-
-            raw_body = _httpx_request_bytes(request)
-            request_body = _decode_request_body(
-                raw_body if raw_body is not None else getattr(request, "stream", None),
-                request.headers.get("content-type"),
-            )
-            stream_requested = bool(kwargs.get("stream", False))
-            is_streaming = _is_streaming_request(request_body, url) or stream_requested
-
-            event_id = uuid.uuid4().hex
-            admission_decision = _run_admission_sync(_admission_payload(
-                event_id, extractor, url, request_body, raw_body, ctx, is_streaming,
-            ))
-
-            try:
-                response = _state._original_httpx_send(self, request_to_send, **kwargs)
-            except Exception:
-                _settle_sync(admission_decision, None, None, event_id)
-                raise
-
-            if stream_requested:
-                # Wrap the response's iteration methods to capture streaming data
-                _wrap_streaming_response(
-                    response, extractor, url, request.method,
-                    request_body, start, call_site, ctx,
-                    event_id=event_id,
-                    admission_decision=admission_decision,
-                    capture_body=capture_body,
-                )
-            elif is_streaming or _is_stream_response(response.headers):
-                # send() already read the whole stream; nothing will iterate it.
-                recorder = _StreamRecorder(
-                    extractor, url, request.method, request_body, start, call_site, ctx,
-                    status_code=response.status_code, headers=response.headers,
-                    event_id=event_id, admission_decision=admission_decision,
-                    capture_body=capture_body,
-                )
-                recorder.chunk(response.content)
-                recorder.done()
-            else:
-                # Non-streaming — read body normally
-                duration_ms = (time.perf_counter() - start) * 1000
-                response_body = None
-                if _reads_body(extractor, url, response.headers):
-                    try:
-                        response_body = response.json()
-                    except Exception:
-                        pass
-                usage = call_usage(extractor, url, request_body, response_body,
-                                   response.headers, response.status_code, request.method)
-                _process(extractor, url, request.method, response.status_code,
-                         request_body, response_body, duration_ms,
-                         False, None, call_site, ctx, event_id=event_id,
-                         capture_body=capture_body, usage=usage,
-                         response_headers=response.headers)
-                _settle_sync(admission_decision, usage, response.status_code, event_id)
-
-            return response
-
-        httpx.Client.send = patched_send
-
-        # Async client
-        _state._original_httpx_async_send = httpx.AsyncClient.send
-
-        async def patched_async_send(self: Any, request: Any, **kwargs: Any) -> Any:
-            url = str(request.url)
-            extractor = find_extractor(url)
-
-            if not extractor:
-                return await _state._original_httpx_async_send(self, request, **kwargs)
-
-            call_site = capture_call_site()
-            ctx = {**_state.default_context, **get_context()}
-            for key, value in _incoming_context(request.headers).items():
-                ctx.setdefault(key, value)
-            request_to_send = _strip_httpx_context_headers(request)
-            capture_body = _state.capture_body
-            start = time.perf_counter()
-
-            raw_body = _httpx_request_bytes(request)
-            request_body = _decode_request_body(
-                raw_body if raw_body is not None else getattr(request, "stream", None),
-                request.headers.get("content-type"),
-            )
-            stream_requested = bool(kwargs.get("stream", False))
-            is_streaming = _is_streaming_request(request_body, url) or stream_requested
-
-            event_id = uuid.uuid4().hex
-            admission_decision = await _run_admission_async(_admission_payload(
-                event_id, extractor, url, request_body, raw_body, ctx, is_streaming,
-            ))
-
-            try:
-                response = await _state._original_httpx_async_send(self, request_to_send, **kwargs)
-            except Exception:
-                await _settle_async(admission_decision, None, None, event_id)
-                raise
-
-            if stream_requested:
-                _wrap_streaming_response(
-                    response, extractor, url, request.method,
-                    request_body, start, call_site, ctx,
-                    event_id=event_id,
-                    admission_decision=admission_decision,
-                    settlement_async=True,
-                    capture_body=capture_body,
-                )
-            elif is_streaming or _is_stream_response(response.headers):
-                recorder = _StreamRecorder(
-                    extractor, url, request.method, request_body, start, call_site, ctx,
-                    status_code=response.status_code, headers=response.headers,
-                    event_id=event_id, admission_decision=admission_decision,
-                    settlement_async=True, capture_body=capture_body,
-                )
-                recorder.chunk(response.content)
-                await recorder.finish_async()
-            else:
-                duration_ms = (time.perf_counter() - start) * 1000
-                response_body = None
-                if _reads_body(extractor, url, response.headers):
-                    try:
-                        response_body = response.json()
-                    except Exception:
-                        pass
-                usage = call_usage(extractor, url, request_body, response_body,
-                                   response.headers, response.status_code, request.method)
-                _process(extractor, url, request.method, response.status_code,
-                         request_body, response_body, duration_ms,
-                         False, None, call_site, ctx, event_id=event_id,
-                         capture_body=capture_body, usage=usage,
-                         response_headers=response.headers)
-                await _settle_async(admission_decision, usage, response.status_code, event_id)
-
-            return response
-
-        httpx.AsyncClient.send = patched_async_send
-
-    except ImportError:
-        if _state.debug:
-            logger.debug("[costkey] httpx not installed, skipping patch")
-
-
-def _wrap_streaming_response(
-    response: Any, extractor: Any, url: str, method: str,
-    request_body: Any, start: float,
-    call_site: Any, ctx: dict[str, Any], event_id: str | None = None,
-    admission_decision: dict[str, Any] | None = None,
-    settlement_async: bool = False,
-    capture_body: bool | None = None,
-) -> _StreamRecorder:
-    """
-    Wrap httpx Response iteration methods to capture streaming data.
-
-    The Anthropic/OpenAI SDKs use response.iter_lines() or response.iter_bytes()
-    to consume SSE streams. We wrap these methods to accumulate the bytes,
-    then extract usage + timing when iteration finishes.
-    """
-    recorder = _StreamRecorder(
-        extractor, url, method, request_body, start, call_site, ctx,
-        status_code=getattr(response, "status_code", None),
-        headers=getattr(response, "headers", None),
-        event_id=event_id, admission_decision=admission_decision,
-        settlement_async=settlement_async, capture_body=capture_body,
-    )
-
-    for name, record in (
-        ("iter_bytes", recorder.chunk), ("iter_lines", recorder.line),
-        ("iter_text", recorder.chunk), ("iter_raw", recorder.chunk),
-    ):
-        original = getattr(response, name, None)
-        if original is not None:
-            setattr(response, name, _record_iter(recorder, original, record))
-
-    for name, record in (
-        ("aiter_bytes", recorder.chunk), ("aiter_lines", recorder.line),
-        ("aiter_text", recorder.chunk), ("aiter_raw", recorder.chunk),
-    ):
-        original = getattr(response, name, None)
-        if original is not None:
-            setattr(response, name, _record_aiter(recorder, original, record))
-
-    # Wrap read() for cases where the body is read all at once
-    original_read = getattr(response, "read", None)
-    if original_read is not None:
-        @functools.wraps(original_read)
-        def wrapped_read(*a: Any, **kw: Any) -> bytes:
-            recorder.depth += 1
-            try:
-                data = original_read(*a, **kw)
-            finally:
-                recorder.depth -= 1
-            if recorder.depth == 0:
-                recorder.chunk(data)
-                recorder.done()
-            return data
-
-        response.read = wrapped_read
-
-    original_aread = getattr(response, "aread", None)
-    if original_aread is not None:
-        @functools.wraps(original_aread)
-        async def wrapped_aread(*a: Any, **kw: Any) -> bytes:
-            recorder.depth += 1
-            try:
-                data = await original_aread(*a, **kw)
-            finally:
-                recorder.depth -= 1
-            if recorder.depth == 0:
-                recorder.chunk(data)
-                await recorder.finish_async()
-            return data
-
-        response.aread = wrapped_aread
-
-    # A stream closed without being iterated still reports. httpx closes the
-    # response itself at the end of iteration, before decoders flush, so an
-    # in-progress iteration reports from its own finally instead.
-    original_close = getattr(response, "close", None)
-    if original_close is not None:
-        @functools.wraps(original_close)
-        def wrapped_close(*a: Any, **kw: Any) -> Any:
-            try:
-                return original_close(*a, **kw)
-            finally:
-                if recorder.depth == 0:
-                    recorder.done()
-
-        response.close = wrapped_close
-
-    original_aclose = getattr(response, "aclose", None)
-    if original_aclose is not None:
-        @functools.wraps(original_aclose)
-        async def wrapped_aclose(*a: Any, **kw: Any) -> Any:
-            try:
-                return await original_aclose(*a, **kw)
-            finally:
-                if recorder.depth == 0:
-                    await recorder.finish_async()
-
-        response.aclose = wrapped_aclose
-
-    _emit_when_collected(response, recorder)
-    return recorder
-
-
-def _unpatch_httpx() -> None:
-    try:
-        import httpx
-        if _state._original_httpx_send:
-            httpx.Client.send = _state._original_httpx_send
-        if _state._original_httpx_async_send:
-            httpx.AsyncClient.send = _state._original_httpx_async_send
-    except ImportError:
-        pass
-
-
-# ── requests patching ──
-
-def _patch_requests() -> None:
-    try:
-        import requests
-
-        _state._original_requests_send = requests.Session.send
-
-        def patched_send(self: Any, request: Any, **kwargs: Any) -> Any:
-            url = str(request.url)
-            extractor = find_extractor(url)
-
-            if not extractor:
-                return _state._original_requests_send(self, request, **kwargs)
-
-            call_site = capture_call_site()
-            ctx = {**_state.default_context, **get_context()}
-            for key, value in _incoming_context(request.headers).items():
-                ctx.setdefault(key, value)
-            request_to_send = _strip_requests_context_headers(request)
-            capture_body = _state.capture_body
-            start = time.perf_counter()
-
-            request_body = _decode_request_body(request.body, request.headers.get("content-type"))
-            stream_requested = bool(kwargs.get("stream", False))
-            is_streaming = _is_streaming_request(request_body, url) or stream_requested
-            event_id = uuid.uuid4().hex
-            admission_decision = _run_admission_sync(_admission_payload(
-                event_id, extractor, url, request_body, request.body, ctx, is_streaming,
-            ))
-
-            try:
-                response = _state._original_requests_send(self, request_to_send, **kwargs)
-            except Exception:
-                _settle_sync(admission_decision, None, None, event_id)
-                raise
-
-            if stream_requested or is_streaming or _is_stream_response(response.headers):
-                recorder = _StreamRecorder(
-                    extractor, url, request.method, request_body, start, call_site, ctx,
-                    status_code=response.status_code, headers=response.headers,
-                    event_id=event_id, admission_decision=admission_decision,
-                    capture_body=capture_body,
-                )
-                if stream_requested:
-                    # Reading here would buffer the stream before the caller
-                    # sees it; record what the caller reads instead.
-                    _wrap_requests_stream(response, recorder)
-                else:
-                    recorder.chunk(response.content)
-                    recorder.done()
-                return response
-
-            duration_ms = (time.perf_counter() - start) * 1000
-            response_body = None
-            if _reads_body(extractor, url, response.headers):
-                try:
-                    response_body = response.json()
-                except Exception:
-                    response_body = None
-            usage = call_usage(extractor, url, request_body, response_body,
-                               response.headers, response.status_code, request.method)
-
-            _process(extractor, url, request.method, response.status_code,
-                     request_body, response_body, duration_ms,
-                     False, None, call_site, ctx, event_id=event_id,
-                     capture_body=capture_body, usage=usage,
-                     response_headers=response.headers)
-            _settle_sync(admission_decision, usage, response.status_code, event_id)
-
-            return response
-
-        requests.Session.send = patched_send
-
-    except ImportError:
-        if _state.debug:
-            logger.debug("[costkey] requests not installed, skipping patch")
-
-
-def _wrap_requests_stream(response: Any, recorder: _StreamRecorder) -> None:
-    # iter_lines(), .content, .text and .json() all read through iter_content.
-    response.iter_content = _record_iter(recorder, response.iter_content, recorder.chunk)
-    original_close = response.close
-
-    @functools.wraps(original_close)
-    def wrapped_close(*a: Any, **kw: Any) -> Any:
-        try:
-            return original_close(*a, **kw)
-        finally:
-            recorder.done()
-
-    response.close = wrapped_close
-    _emit_when_collected(response, recorder)
-
-
-def _unpatch_requests() -> None:
-    try:
-        import requests
-        if _state._original_requests_send:
-            requests.Session.send = _state._original_requests_send
-    except ImportError:
-        pass
-
-
-# ── aiohttp patching ──
 
 class _ReplayProtocol:
     """Flow control for a reader that only replays an already-read body."""
@@ -2044,6 +885,766 @@ def _url_with_params(url: str, params: Any) -> str:
         return url
 
 
+
+def _reservation_id_of(decision: Any) -> str | None:
+    return _reservation_id(decision) if isinstance(decision, dict) else None
+
+
+def _settlement_payload(decision: dict[str, Any] | None, event_id: str) -> dict[str, Any] | None:
+    """The provider was attempted; the server reconciles the outcome from the
+    call event (same ``eventId``) rather than the SDK classifying it."""
+    reservation_id = _reservation_id_of(decision)
+    if not reservation_id:
+        return None
+    return {
+        "projectId": _state.project_id,
+        "reservationId": reservation_id,
+        "settlementId": f"{event_id}:settlement",
+        "eventId": event_id,
+        "outcome": "unknown",
+        "providerAttempted": True,
+    }
+
+
+def _settle_sync(decision: dict[str, Any] | None, event_id: str) -> None:
+    payload = _settlement_payload(decision, event_id)
+    settler = getattr(_state.admission, "settle", None)
+    if not payload or not callable(settler):
+        return
+    for attempt in range(2):
+        try:
+            settler(payload)
+            return
+        except Exception:
+            if attempt == 1 and _state.debug:
+                logger.warning("[costkey] policy settlement unavailable; reservation remains pending")
+
+
+async def _settle_async(decision: dict[str, Any] | None, event_id: str) -> None:
+    payload = _settlement_payload(decision, event_id)
+    settler = getattr(_state.admission, "settle", None)
+    if not payload or not callable(settler):
+        return
+    for attempt in range(2):
+        try:
+            if inspect.iscoroutinefunction(settler):
+                await settler(payload)
+            else:
+                await asyncio.to_thread(settler, payload)
+            return
+        except Exception:
+            if attempt == 1 and _state.debug:
+                logger.warning("[costkey] policy settlement unavailable; reservation remains pending")
+
+
+# ── Active spans owned by other tracers ──
+#
+# Spans opened through ``costkey.span`` become the active span of the current
+# context. Spans bridged from another tracer (OpenTelemetry, CrewAI's event
+# bus) are detached: the other tracer owns "current", so a resolver reports
+# which of its spans is current, and a call is attributed to whichever active
+# span started last (the inner one).
+
+_span_seq_lock = threading.Lock()
+_span_seq: dict[str, int] = {}
+_span_counter = itertools.count(1)
+_span_resolvers: list[Callable[[], dict[str, Any] | None]] = []
+
+
+def _span_opened(span_id: Any) -> None:
+    if isinstance(span_id, str):
+        with _span_seq_lock:
+            _span_seq[span_id] = next(_span_counter)
+
+
+def _span_closed(span_id: Any) -> None:
+    if isinstance(span_id, str):
+        with _span_seq_lock:
+            _span_seq.pop(span_id, None)
+
+
+def span_sequence(span_id: Any) -> int:
+    """When an open span started, relative to other open spans (0 if closed)."""
+    with _span_seq_lock:
+        return _span_seq.get(span_id, 0) if isinstance(span_id, str) else 0
+
+
+def register_span_resolver(resolver: Callable[[], dict[str, Any] | None]) -> None:
+    """Add a callable returning the context of another tracer's current span."""
+    if resolver not in _span_resolvers:
+        _span_resolvers.append(resolver)
+
+
+def unregister_span_resolver(resolver: Callable[[], dict[str, Any] | None]) -> None:
+    if resolver in _span_resolvers:
+        _span_resolvers.remove(resolver)
+
+
+def _with_active_span(ctx: dict[str, Any]) -> dict[str, Any]:
+    if not _span_resolvers:
+        return ctx
+    best_seq = span_sequence(ctx.get("spanId"))
+    best: dict[str, Any] | None = None
+    for resolver in list(_span_resolvers):
+        try:
+            candidate = resolver()
+        except Exception:
+            continue
+        if not isinstance(candidate, dict):
+            continue
+        seq = span_sequence(candidate.get("spanId"))
+        if seq > best_seq:
+            best_seq, best = seq, candidate
+    return {**ctx, **best} if best else ctx
+
+
+# ── One captured call ──
+
+class _Call:
+    """A provider call in flight: its request telemetry, context and timing."""
+
+    def __init__(self, provider: str, url: str, method: str, *, headers: Any,
+                 body: Any, body_bytes: int | None, capture: Callable[[], Any] | None = None,
+                 extra_context_headers: Any = None) -> None:
+        self.provider = provider
+        self.url = url
+        self.method = (method or "GET").upper()
+        self.request_headers = headers
+        self.request_body = body
+        self.request_bytes = body_bytes
+        self.call_site = capture_call_site()
+        ctx = _with_active_span({**_state.default_context, **get_context()})
+        for key, value in _incoming_context(extra_context_headers if extra_context_headers is not None else headers).items():
+            ctx.setdefault(key, value)
+        self.ctx = ctx
+        self.capture_body = _state.capture_body
+        self.captured_request = None
+        if self.capture_body and capture is not None:
+            try:
+                self.captured_request = capture()
+            except Exception:
+                self.captured_request = None
+        self.event_id = uuid.uuid4().hex
+        self.started_at = _telemetry.iso_now()
+        self.start = time.perf_counter()
+        self.decision: dict[str, Any] | None = None
+        self.streaming = False
+        self.sent = False
+
+    def request_block(self) -> dict[str, Any]:
+        return {
+            "method": self.method,
+            "url": _telemetry.sanitize_url(self.url),
+            "headers": _telemetry.request_headers(self.request_headers),
+            "body": self.request_body,
+            "bytes": self.request_bytes,
+        }
+
+    def admission_payload(self) -> dict[str, Any]:
+        return {
+            "id": self.event_id,
+            "admissionId": self.event_id,
+            "requestId": self.event_id,
+            "projectId": _state.project_id,
+            "provider": self.provider,
+            "context": _safe_admission_context(self.ctx),
+            # Metadata only: the request skeleton, never prompt text or
+            # credentials. The server estimates usage bounds from it.
+            "request": self.request_block(),
+        }
+
+    def finish(self, *, status: int | None = None, headers: Any = None, body: Any = None,
+               body_bytes: int | None = None, stream: dict[str, Any] | None = None,
+               error: BaseException | dict[str, Any] | None = None, responded: bool = True,
+               captured_response: Any = None) -> None:
+        if self.sent:
+            return
+        self.sent = True
+        try:
+            duration_ms = (time.perf_counter() - self.start) * 1000
+            data = _telemetry.build(
+                method=self.method,
+                url=self.url,
+                request_header_values=self.request_headers,
+                request_body=self.request_body,
+                request_bytes=self.request_bytes,
+                status=status,
+                response_header_values=headers,
+                response_body=body,
+                response_bytes=body_bytes,
+                stream=stream,
+                error=error,
+                started_at=self.started_at,
+                duration_ms=duration_ms,
+                responded=responded,
+            )
+            _emit_call(self, data, status, duration_ms, stream is not None, captured_response)
+        except Exception:
+            if _state.debug:
+                logger.warning("[costkey] Error processing event", exc_info=True)
+
+
+def _emit_call(call: _Call, data: dict[str, Any], status: int | None, duration_ms: float,
+               streamed: bool, captured_response: Any) -> None:
+    ctx = call.ctx
+    # LiveKit/session adapters can own a component's charge; callers scope
+    # this opt-out around the overlapping provider call.
+    if ctx.get("costkeyCapture") in {"manual", "explicit", "disabled"}:
+        return
+    attempt_label = ctx.get("attemptId", ctx.get("attempt_id"))
+    parent_event = ctx.get("parentEventId", ctx.get("parent_event_id"))
+    capture = call.capture_body
+    event = CostKeyEvent(
+        id=call.event_id,
+        timestamp=call.started_at,
+        project_id=_state.project_id,
+        provider=call.provider,
+        url=_safe_url(call.url),
+        method=call.method,
+        status_code=status,
+        duration_ms=round(duration_ms, 2),
+        streaming=streamed,
+        call_site=call.call_site,
+        context=_scrub(ctx),
+        request_body=_json_safe(_scrub(call.captured_request)) if capture else None,
+        response_body=_json_safe(_scrub(captured_response)) if capture else None,
+        telemetry=data,
+        event_type="call",
+        source="auto",
+        trace_id=ctx.get("traceId", ctx.get("trace_id")),
+        trace_name=ctx.get("traceName", ctx.get("trace_name")),
+        group_id=ctx.get("groupId", ctx.get("group_id")),
+        group_name=ctx.get("groupName", ctx.get("group_name")),
+        group_kind=ctx.get("groupKind", ctx.get("group_kind")),
+        execution_id=ctx.get("executionId", ctx.get("execution_id")),
+        phase=ctx.get("phase"),
+        dataset_revision=ctx.get("datasetRevision", ctx.get("dataset_revision")),
+        case_id=ctx.get("caseId", ctx.get("case_id")),
+        configuration=_scrub(ctx.get("configuration")) if isinstance(ctx.get("configuration"), dict) else None,
+        attempt_id=attempt_label if isinstance(attempt_label, str) and attempt_label.strip() else call.event_id,
+        parent_event_id=parent_event if isinstance(parent_event, str) and parent_event.strip() else None,
+        span_id=ctx.get("spanId") if isinstance(ctx.get("spanId"), str) else None,
+    )
+    _dispatch_event(event, legacy_hook=True)
+
+
+def _json_body(data: Any) -> Any:
+    """Parse a body for opt-in content capture only."""
+    if not data:
+        return None
+    try:
+        return json.loads(data)
+    except Exception:
+        return None
+
+
+# ── Streamed (or deferred) responses ──
+
+def _content_length(headers: Any) -> int | None:
+    for key, value in _telemetry._header_items(headers):
+        if key == "content-length":
+            try:
+                return int(value)
+            except ValueError:
+                return None
+    return None
+
+
+def _is_multipart(body: Any) -> bool:
+    return isinstance(body, dict) and "$multipart" in body
+
+class _StreamRecorder:
+    """Records one streamed response and emits its call event once.
+
+    Clients feed it the bytes (or typed events) the caller consumes; it emits
+    when the stream ends, or when the caller stops early and closes it.
+    """
+
+    def __init__(self, call: _Call, *, status_code: int | None, headers: Any,
+                 settlement_async: bool = False) -> None:
+        self.call = call
+        self.status_code = status_code
+        self.headers = headers
+        self.settlement_async = settlement_async
+        self.collector = _telemetry.StreamCollector(
+            _telemetry.content_type(headers), start=call.start, content_length=_content_length(headers),
+            capture=call.capture_body,
+        )
+        # Client read methods call each other (iter_lines -> iter_text ->
+        # iter_bytes); only the outermost one records.
+        self.depth = 0
+        self.sent = False
+        self.error: BaseException | None = None
+        self.settlement_task: Any = None
+
+    def chunk(self, data: Any) -> None:
+        if self.sent or not data:
+            return
+        try:
+            self.collector.feed(data)
+        except Exception:
+            logger.debug("[costkey] stream chunk capture failed", exc_info=True)
+
+    def line(self, data: Any) -> None:
+        # Line iterators strip the separator the stream framing needs.
+        if isinstance(data, str):
+            self.chunk(data + "\n")
+        elif isinstance(data, (bytes, bytearray)):
+            self.chunk(bytes(data) + b"\n")
+
+    def event(self, payload: Any) -> None:
+        """Typed stream events (botocore) arrive already decoded."""
+        if self.sent:
+            return
+        try:
+            self.collector.event(payload)
+        except Exception:
+            logger.debug("[costkey] stream event capture failed", exc_info=True)
+
+    def fail(self, exc: BaseException) -> None:
+        if not isinstance(exc, GeneratorExit):
+            self.error = exc
+
+    def done(self) -> None:
+        if self.sent:
+            return
+        self.sent = True
+        try:
+            stream, body = self.collector.finish()
+            self.call.finish(
+                status=self.status_code, headers=self.headers, body=body,
+                body_bytes=self.collector.bytes, stream=stream, error=self.error,
+                captured_response=self.collector.captured_body() if self.call.capture_body else None,
+            )
+        except Exception:
+            logger.debug("[costkey] stream capture failed", exc_info=True)
+        if _reservation_id_of(self.call.decision) is None:
+            return
+        if self.settlement_async:
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                loop = None
+            if loop is not None:
+                self.settlement_task = loop.create_task(_settle_async(self.call.decision, self.call.event_id))
+                return
+        _settle_sync(self.call.decision, self.call.event_id)
+
+    async def finish_async(self) -> None:
+        self.done()
+        if self.settlement_task is not None:
+            await self.settlement_task
+
+
+def _record_iter(recorder: _StreamRecorder, original: Any, record: Callable[[Any], None]) -> Any:
+    @functools.wraps(original)
+    def wrapped(*a: Any, **kw: Any) -> Iterator[Any]:
+        recorder.depth += 1
+        outer = recorder.depth == 1
+        try:
+            for item in original(*a, **kw):
+                if outer:
+                    record(item)
+                yield item
+        except BaseException as exc:
+            if outer:
+                recorder.fail(exc)
+            raise
+        finally:
+            recorder.depth -= 1
+            if outer:
+                recorder.done()
+    return wrapped
+
+
+def _record_aiter(recorder: _StreamRecorder, original: Any, record: Callable[[Any], None]) -> Any:
+    @functools.wraps(original)
+    async def wrapped(*a: Any, **kw: Any) -> AsyncIterator[Any]:
+        recorder.depth += 1
+        outer = recorder.depth == 1
+        try:
+            async for item in original(*a, **kw):
+                if outer:
+                    record(item)
+                yield item
+        except BaseException as exc:
+            if outer:
+                recorder.fail(exc)
+            raise
+        finally:
+            recorder.depth -= 1
+            if outer:
+                await recorder.finish_async()
+    return wrapped
+
+
+def _emit_when_collected(owner: Any, recorder: _StreamRecorder) -> None:
+    """A stream the caller drops without finishing or closing still reports."""
+    try:
+        weakref.finalize(owner, recorder.done).atexit = False
+    except TypeError:
+        pass
+
+
+# ── httpx ──
+
+def _httpx_request(request: Any) -> tuple[Any, int | None, Callable[[], Any]]:
+    """Request body skeleton, byte length and a capture-only decoder."""
+    kind = _telemetry.content_type(request.headers)
+    try:
+        raw = request.content
+    except Exception:
+        raw = None
+    if raw is not None:
+        return (
+            _telemetry.body_skeleton(raw, kind),
+            len(raw),
+            lambda: _decode_request_body(raw, kind),
+        )
+    stream = getattr(request, "stream", None)
+    size = None
+    try:
+        size = stream.get_content_length() if stream is not None else None
+    except Exception:
+        size = None
+    body = _telemetry.multipart_from_httpx(stream)
+    return (
+        body,
+        None if _is_multipart(body) else size,
+        lambda: _decode_request_body(stream, kind),
+    )
+
+
+def _httpx_call(request: Any) -> _Call | None:
+    url = str(request.url)
+    provider = _captured_provider(url)
+    if provider is None:
+        return None
+    body, size, capture = _httpx_request(request)
+    return _Call(provider, url, request.method, headers=request.headers,
+                 body=body, body_bytes=size, capture=capture)
+
+
+def _finish_httpx(call: _Call, response: Any, settlement_async: bool) -> _StreamRecorder | None:
+    """Emit a fully-read response now; return a recorder for an unread one."""
+    headers = response.headers
+    if _is_stream_response(headers) or _is_streaming_request_body(call):
+        recorder = _StreamRecorder(call, status_code=response.status_code, headers=headers,
+                                   settlement_async=settlement_async)
+        recorder.chunk(response.content)
+        return recorder
+    content = response.content
+    call.finish(
+        status=response.status_code, headers=headers,
+        body=_telemetry.body_skeleton(content, _telemetry.content_type(headers)),
+        body_bytes=len(content),
+        captured_response=_json_body(content) if call.capture_body and not _is_binary_response(headers) else None,
+    )
+    return None
+
+
+def _is_streaming_request_body(call: _Call) -> bool:
+    body = call.request_body
+    return isinstance(body, dict) and body.get("stream") is True or _is_streaming_request(None, call.url)
+
+
+_HTTPX_MODULES = ("httpx", "httpx2")
+
+
+def _patch_httpx() -> None:
+    import importlib
+    for name in _HTTPX_MODULES:
+        try:
+            module = importlib.import_module(name)
+        except ImportError:
+            if _state.debug:
+                logger.debug("[costkey] %s not installed, skipping patch", name)
+            continue
+        if name in _state._original_httpx:
+            continue
+        _patch_httpx_module(name, module)
+
+
+def _patch_httpx_module(name: str, httpx: Any) -> None:
+    original_send = httpx.Client.send
+    original_async_send = httpx.AsyncClient.send
+    _state._original_httpx[name] = (original_send, original_async_send)
+
+    def patched_send(self: Any, request: Any, **kwargs: Any) -> Any:
+        try:
+            call = _httpx_call(request)
+        except Exception:
+            logger.debug("[costkey] httpx request inspection failed", exc_info=True)
+            call = None
+        if call is None:
+            return original_send(self, request, **kwargs)
+        request_to_send = _strip_httpx_context_headers(request)
+        call.decision = _run_admission_sync(call.admission_payload())
+        try:
+            response = original_send(self, request_to_send, **kwargs)
+        except BaseException as exc:
+            call.finish(error=exc, responded=False)
+            _settle_sync(call.decision, call.event_id)
+            raise
+        try:
+            if kwargs.get("stream", False):
+                _wrap_streaming_response(response, call)
+            else:
+                recorder = _finish_httpx(call, response, settlement_async=False)
+                if recorder is not None:
+                    recorder.done()
+                else:
+                    _settle_sync(call.decision, call.event_id)
+        except Exception:
+            logger.debug("[costkey] httpx response capture failed", exc_info=True)
+        return response
+
+    async def patched_async_send(self: Any, request: Any, **kwargs: Any) -> Any:
+        try:
+            call = _httpx_call(request)
+        except Exception:
+            logger.debug("[costkey] httpx request inspection failed", exc_info=True)
+            call = None
+        if call is None:
+            return await original_async_send(self, request, **kwargs)
+        request_to_send = _strip_httpx_context_headers(request)
+        call.decision = await _run_admission_async(call.admission_payload())
+        try:
+            response = await original_async_send(self, request_to_send, **kwargs)
+        except BaseException as exc:
+            call.finish(error=exc, responded=False)
+            await _settle_async(call.decision, call.event_id)
+            raise
+        try:
+            if kwargs.get("stream", False):
+                _wrap_streaming_response(response, call, settlement_async=True)
+            else:
+                recorder = _finish_httpx(call, response, settlement_async=True)
+                if recorder is not None:
+                    await recorder.finish_async()
+                else:
+                    await _settle_async(call.decision, call.event_id)
+        except Exception:
+            logger.debug("[costkey] httpx response capture failed", exc_info=True)
+        return response
+
+    httpx.Client.send = patched_send
+    httpx.AsyncClient.send = patched_async_send
+
+
+def _wrap_streaming_response(response: Any, call: _Call, settlement_async: bool = False) -> _StreamRecorder:
+    """Record what the caller reads from an httpx streaming response.
+
+    Provider SDKs consume SSE through ``iter_lines``/``iter_bytes`` (or the
+    async variants); every read path is wrapped and the outermost records.
+    """
+    recorder = _StreamRecorder(
+        call, status_code=getattr(response, "status_code", None),
+        headers=getattr(response, "headers", None), settlement_async=settlement_async,
+    )
+
+    for name, record in (
+        ("iter_bytes", recorder.chunk), ("iter_lines", recorder.line),
+        ("iter_text", recorder.chunk), ("iter_raw", recorder.chunk),
+    ):
+        original = getattr(response, name, None)
+        if original is not None:
+            setattr(response, name, _record_iter(recorder, original, record))
+
+    for name, record in (
+        ("aiter_bytes", recorder.chunk), ("aiter_lines", recorder.line),
+        ("aiter_text", recorder.chunk), ("aiter_raw", recorder.chunk),
+    ):
+        original = getattr(response, name, None)
+        if original is not None:
+            setattr(response, name, _record_aiter(recorder, original, record))
+
+    original_read = getattr(response, "read", None)
+    if original_read is not None:
+        @functools.wraps(original_read)
+        def wrapped_read(*a: Any, **kw: Any) -> bytes:
+            recorder.depth += 1
+            try:
+                data = original_read(*a, **kw)
+            except BaseException as exc:
+                recorder.fail(exc)
+                raise
+            finally:
+                recorder.depth -= 1
+            if recorder.depth == 0:
+                recorder.chunk(data)
+                recorder.done()
+            return data
+
+        response.read = wrapped_read
+
+    original_aread = getattr(response, "aread", None)
+    if original_aread is not None:
+        @functools.wraps(original_aread)
+        async def wrapped_aread(*a: Any, **kw: Any) -> bytes:
+            recorder.depth += 1
+            try:
+                data = await original_aread(*a, **kw)
+            except BaseException as exc:
+                recorder.fail(exc)
+                raise
+            finally:
+                recorder.depth -= 1
+            if recorder.depth == 0:
+                recorder.chunk(data)
+                await recorder.finish_async()
+            return data
+
+        response.aread = wrapped_aread
+
+    # A stream closed without being iterated still reports. httpx closes the
+    # response itself at the end of iteration, before decoders flush, so an
+    # in-progress iteration reports from its own finally instead.
+    original_close = getattr(response, "close", None)
+    if original_close is not None:
+        @functools.wraps(original_close)
+        def wrapped_close(*a: Any, **kw: Any) -> Any:
+            try:
+                return original_close(*a, **kw)
+            finally:
+                if recorder.depth == 0:
+                    recorder.done()
+
+        response.close = wrapped_close
+
+    original_aclose = getattr(response, "aclose", None)
+    if original_aclose is not None:
+        @functools.wraps(original_aclose)
+        async def wrapped_aclose(*a: Any, **kw: Any) -> Any:
+            try:
+                return await original_aclose(*a, **kw)
+            finally:
+                if recorder.depth == 0:
+                    await recorder.finish_async()
+
+        response.aclose = wrapped_aclose
+
+    _emit_when_collected(response, recorder)
+    return recorder
+
+
+def _unpatch_httpx() -> None:
+    import importlib
+    for name, (send, async_send) in list(_state._original_httpx.items()):
+        try:
+            module = importlib.import_module(name)
+            module.Client.send = send
+            module.AsyncClient.send = async_send
+        except ImportError:
+            pass
+    _state._original_httpx.clear()
+
+
+# ── requests ──
+
+def _requests_call(request: Any) -> _Call | None:
+    url = str(request.url)
+    provider = _captured_provider(url)
+    if provider is None:
+        return None
+    kind = _telemetry.content_type(request.headers)
+    raw = request.body
+    if isinstance(raw, (bytes, bytearray, str)):
+        body = _telemetry.body_skeleton(raw, kind)
+        size: int | None = len(raw.encode("utf-8") if isinstance(raw, str) else raw)
+        if _is_multipart(body):
+            size = None  # contract: a multipart request has ``bytes`` null
+    else:
+        body = None
+        try:
+            size = int(request.headers.get("content-length"))
+        except Exception:
+            size = None
+    return _Call(provider, url, request.method, headers=request.headers, body=body, body_bytes=size,
+                 capture=lambda: _decode_request_body(raw, kind))
+
+
+def _patch_requests() -> None:
+    try:
+        import requests
+    except ImportError:
+        if _state.debug:
+            logger.debug("[costkey] requests not installed, skipping patch")
+        return
+
+    _state._original_requests_send = requests.Session.send
+
+    def patched_send(self: Any, request: Any, **kwargs: Any) -> Any:
+        try:
+            call = _requests_call(request)
+        except Exception:
+            logger.debug("[costkey] requests inspection failed", exc_info=True)
+            call = None
+        if call is None:
+            return _state._original_requests_send(self, request, **kwargs)
+        request_to_send = _strip_requests_context_headers(request)
+        call.decision = _run_admission_sync(call.admission_payload())
+        try:
+            response = _state._original_requests_send(self, request_to_send, **kwargs)
+        except BaseException as exc:
+            call.finish(error=exc, responded=False)
+            _settle_sync(call.decision, call.event_id)
+            raise
+        try:
+            headers = response.headers
+            if kwargs.get("stream", False):
+                # Reading here would buffer the stream before the caller sees
+                # it; record what the caller reads instead.
+                recorder = _StreamRecorder(call, status_code=response.status_code, headers=headers)
+                _wrap_requests_stream(response, recorder)
+            elif _is_stream_response(headers) or _is_streaming_request_body(call):
+                recorder = _StreamRecorder(call, status_code=response.status_code, headers=headers)
+                recorder.chunk(response.content)
+                recorder.done()
+            else:
+                content = response.content or b""
+                call.finish(
+                    status=response.status_code, headers=headers,
+                    body=_telemetry.body_skeleton(content, _telemetry.content_type(headers)),
+                    body_bytes=len(content),
+                    captured_response=_json_body(content) if call.capture_body and not _is_binary_response(headers) else None,
+                )
+                _settle_sync(call.decision, call.event_id)
+        except Exception:
+            logger.debug("[costkey] requests response capture failed", exc_info=True)
+        return response
+
+    requests.Session.send = patched_send
+
+
+def _wrap_requests_stream(response: Any, recorder: _StreamRecorder) -> None:
+    # iter_lines(), .content, .text and .json() all read through iter_content.
+    response.iter_content = _record_iter(recorder, response.iter_content, recorder.chunk)
+    original_close = response.close
+
+    @functools.wraps(original_close)
+    def wrapped_close(*a: Any, **kw: Any) -> Any:
+        try:
+            return original_close(*a, **kw)
+        finally:
+            recorder.done()
+
+    response.close = wrapped_close
+    _emit_when_collected(response, recorder)
+
+
+def _unpatch_requests() -> None:
+    try:
+        import requests
+        if _state._original_requests_send:
+            requests.Session.send = _state._original_requests_send
+    except ImportError:
+        pass
+    _state._original_requests_send = None
+
+
+# ── aiohttp ──
+
 def _patch_aiohttp() -> None:
     try:
         import aiohttp
@@ -2058,21 +1659,22 @@ def _patch_aiohttp() -> None:
 
     async def patched_request(self: Any, method: str, str_or_url: Any, **kwargs: Any) -> Any:
         try:
-            call = _aiohttp_call(self, method, str_or_url, kwargs)
+            prepared = _aiohttp_call(self, method, str_or_url, kwargs)
         except Exception:
             logger.debug("[costkey] aiohttp request inspection failed", exc_info=True)
-            call = None
-        if call is None:
+            prepared = None
+        if prepared is None:
             return await original(self, method, str_or_url, **kwargs)
-
-        admission_decision = await _run_admission_async(call["admission"])
+        call, send_kwargs = prepared
+        call.decision = await _run_admission_async(call.admission_payload())
         try:
-            response = await original(self, method, str_or_url, **call["kwargs"])
-        except Exception:
-            await _settle_async(admission_decision, None, None, call["event_id"])
+            response = await original(self, method, str_or_url, **send_kwargs)
+        except BaseException as exc:
+            call.finish(error=exc, responded=False)
+            await _settle_async(call.decision, call.event_id)
             raise
         try:
-            await _observe_aiohttp_response(response, call, admission_decision)
+            await _observe_aiohttp_response(response, call)
         except Exception:
             logger.debug("[costkey] aiohttp response capture failed", exc_info=True)
         return response
@@ -2080,95 +1682,83 @@ def _patch_aiohttp() -> None:
     aiohttp.ClientSession._request = patched_request
 
 
-def _aiohttp_call(session: Any, method: str, str_or_url: Any, kwargs: dict[str, Any]) -> dict[str, Any] | None:
+def _aiohttp_body(kwargs: dict[str, Any], kind: str) -> tuple[Any, int | None, Callable[[], Any]]:
+    if kwargs.get("json") is not None:
+        payload = kwargs["json"]
+        try:
+            size: int | None = len(json.dumps(payload).encode("utf-8"))
+        except Exception:
+            size = None
+        return _telemetry.skeleton(payload), size, lambda: payload
+    data = kwargs.get("data")
+    if data is None:
+        return None, None, lambda: None
+    if isinstance(data, (bytes, bytearray, str)):
+        raw = data.encode("utf-8") if isinstance(data, str) else bytes(data)
+        body = _telemetry.body_skeleton(raw, kind)
+        return body, None if _is_multipart(body) else len(raw), lambda: _decode_request_body(raw, kind)
+    if isinstance(data, dict):
+        return _telemetry.skeleton(data), None, lambda: _decode_request_body(data, kind)
+    form = _telemetry.multipart_from_aiohttp(data)
+    return form, None, lambda: _decode_request_body(data, kind)
+
+
+def _aiohttp_call(session: Any, method: str, str_or_url: Any,
+                  kwargs: dict[str, Any]) -> tuple[_Call, dict[str, Any]] | None:
     try:
         url = str(session._build_url(str_or_url))
     except Exception:
         url = str(str_or_url)
     url = _url_with_params(url, kwargs.get("params"))
-    extractor = find_extractor(url)
-    if not extractor or url.startswith(("ws://", "wss://")):
+    provider = _captured_provider(url)
+    if provider is None or url.startswith(("ws://", "wss://")):
         return None
     headers = _lower_headers(kwargs.get("headers"))
     if headers is not None and str(headers.get("upgrade") or "").lower() == "websocket":
         return None
-
-    call_site = capture_call_site()
-    ctx = {**_state.default_context, **get_context()}
-    for key, value in _incoming_context(headers).items():
-        ctx.setdefault(key, value)
     send_kwargs = kwargs
     stripped = _without_carrier_headers(kwargs.get("headers"))
     if stripped is not kwargs.get("headers"):
         send_kwargs = {**kwargs, "headers": stripped}
-
-    raw_body = kwargs.get("data")
-    request_body = kwargs.get("json")
-    if request_body is None:
-        request_body = _decode_request_body(
-            raw_body, headers.get("content-type") if headers is not None else None,
-        )
-    streaming = _is_streaming_request(request_body, url) or _params_request_sse(kwargs.get("params"))
-    event_id = uuid.uuid4().hex
-    return {
-        "extractor": extractor,
-        "url": url,
-        "method": str(method).upper(),
-        "request_body": request_body,
-        "streaming": streaming,
-        "call_site": call_site,
-        "ctx": ctx,
-        "capture_body": _state.capture_body,
-        "event_id": event_id,
-        "kwargs": send_kwargs,
-        "admission": _admission_payload(
-            event_id, extractor, url, request_body,
-            raw_body if isinstance(raw_body, (bytes, bytearray, str)) else None, ctx, streaming,
-        ),
-        "start": time.perf_counter(),
-    }
+    if kwargs.get("json") is not None:
+        injected = _providers.inject_stream_usage(url, kwargs["json"])
+        if injected is not kwargs["json"]:
+            send_kwargs = {**send_kwargs, "json": injected}
+    kind = _telemetry.content_type(headers)
+    body, size, capture = _aiohttp_body(kwargs, kind)
+    call = _Call(provider, url, method, headers=headers, body=body, body_bytes=size, capture=capture)
+    call.streaming = _is_streaming_request(kwargs.get("json"), url) or _params_request_sse(kwargs.get("params"))
+    return call, send_kwargs
 
 
-async def _observe_aiohttp_response(response: Any, call: dict[str, Any],
-                                    admission_decision: dict[str, Any] | None) -> None:
+async def _observe_aiohttp_response(response: Any, call: _Call) -> None:
     status = getattr(response, "status", None)
     headers = getattr(response, "headers", None)
     if status == 101:
         return
-    if call["streaming"] or _is_stream_response(headers):
-        recorder = _StreamRecorder(
-            call["extractor"], call["url"], call["method"], call["request_body"],
-            call["start"], call["call_site"], call["ctx"],
-            status_code=status, headers=headers, event_id=call["event_id"],
-            admission_decision=admission_decision, settlement_async=True,
-            capture_body=call["capture_body"],
-        )
+    streaming = call.streaming or _is_streaming_request_body(call)
+    if streaming or _is_stream_response(headers) or _is_binary_response(headers):
+        # Streams and media are recorded as the caller reads them; reading
+        # here would buffer the whole body before the caller sees it.
+        recorder = _StreamRecorder(call, status_code=status, headers=headers, settlement_async=True)
         _record_aiohttp_stream(response, recorder)
         return
-
-    response_body = None
-    if _reads_body(call["extractor"], call["url"], headers):
-        try:
-            # aiohttp caches the body for read()/text()/json(); direct
-            # ``content`` readers get a replay of it.
-            body = await response.read()
-        except Exception:
-            logger.debug("[costkey] aiohttp body read failed", exc_info=True)
-            body = None
-        if body is not None:
-            _replay_content(response, body)
-            try:
-                response_body = json.loads(body)
-            except Exception:
-                response_body = None
-    duration_ms = (time.perf_counter() - call["start"]) * 1000
-    usage = call_usage(call["extractor"], call["url"], call["request_body"], response_body,
-                       headers, status, call["method"])
-    _process(call["extractor"], call["url"], call["method"], status,
-             call["request_body"], response_body, duration_ms,
-             False, None, call["call_site"], call["ctx"], event_id=call["event_id"],
-             capture_body=call["capture_body"], usage=usage, response_headers=headers)
-    await _settle_async(admission_decision, usage, status, call["event_id"])
+    try:
+        # aiohttp caches the body for read()/text()/json(); direct
+        # ``content`` readers get a replay of it.
+        content = await response.read()
+    except Exception:
+        logger.debug("[costkey] aiohttp body read failed", exc_info=True)
+        content = None
+    if content is not None:
+        _replay_content(response, content)
+    call.finish(
+        status=status, headers=headers,
+        body=_telemetry.body_skeleton(content, _telemetry.content_type(headers)) if content is not None else None,
+        body_bytes=len(content) if content is not None else None,
+        captured_response=_json_body(content) if call.capture_body else None,
+    )
+    await _settle_async(call.decision, call.event_id)
 
 
 def _unpatch_aiohttp() -> None:
@@ -2182,7 +1772,7 @@ def _unpatch_aiohttp() -> None:
     _state._original_aiohttp_request = None
 
 
-# ── botocore (boto3) Bedrock patching ──
+# ── botocore (boto3) Bedrock ──
 
 _BEDROCK_OPERATIONS = {
     "Converse": "converse",
@@ -2190,11 +1780,10 @@ _BEDROCK_OPERATIONS = {
     "InvokeModel": "invoke",
     "InvokeModelWithResponseStream": "invoke-with-response-stream",
 }
-_BEDROCK = BedrockExtractor()
 
 
 class _BedrockEventStream:
-    """Iterates a botocore EventStream, recording usage events for one call."""
+    """Iterates a botocore EventStream, recording each event for one call."""
 
     def __init__(self, stream: Any, recorder: _StreamRecorder) -> None:
         self._stream = stream
@@ -2204,11 +1793,11 @@ class _BedrockEventStream:
     def __iter__(self) -> Iterator[Any]:
         try:
             for event in self._stream:
-                try:
-                    self._recorder.observe(_bedrock_payload_usage(event, _BEDROCK))
-                except Exception:
-                    logger.debug("[costkey] bedrock stream capture failed", exc_info=True)
+                self._recorder.event(event)
                 yield event
+        except BaseException as exc:
+            self._recorder.fail(exc)
+            raise
         finally:
             self._recorder.done()
 
@@ -2222,31 +1811,12 @@ class _BedrockEventStream:
         return getattr(self._stream, name)
 
 
-def _bedrock_request_body(operation_name: str, api_params: Any) -> Any:
-    if not isinstance(api_params, dict):
-        return None
-    if operation_name.startswith("InvokeModel"):
-        body = api_params.get("body")
-        if isinstance(body, (bytes, bytearray, str)):
-            try:
-                return _json_safe(json.loads(body))
-            except Exception:
-                return None
-        return None
-    return _json_safe(api_params)
-
-
-def _bedrock_response_meta(response: Any) -> tuple[int | None, Any, str | None]:
+def _bedrock_response_meta(response: Any) -> tuple[int | None, Any]:
     meta = response.get("ResponseMetadata") if isinstance(response, dict) else None
     if not isinstance(meta, dict):
-        return None, None, None
+        return None, None
     status = meta.get("HTTPStatusCode")
-    request_id = meta.get("RequestId")
-    return (
-        status if isinstance(status, int) else None,
-        meta.get("HTTPHeaders"),
-        request_id if isinstance(request_id, str) and request_id else None,
-    )
+    return (status if isinstance(status, int) else None), meta.get("HTTPHeaders")
 
 
 def _patch_botocore() -> None:
@@ -2274,75 +1844,86 @@ def _patch_botocore() -> None:
     BaseClient._make_api_call = patched_make_api_call
 
 
+def _bedrock_call(client: Any, operation_name: str, path: str, api_params: Any) -> _Call:
+    params = api_params if isinstance(api_params, dict) else {}
+    model_id = params.get("modelId")
+    endpoint = str(getattr(client.meta, "endpoint_url", "") or "https://bedrock-runtime.amazonaws.com")
+    url = f"{endpoint.rstrip('/')}/model/{quote(str(model_id or ''), safe='')}/{path}"
+    if operation_name.startswith("InvokeModel"):
+        raw = params.get("body")
+        kind = str(params.get("contentType") or "application/json")
+        raw_bytes = raw.encode("utf-8") if isinstance(raw, str) else raw
+        body = _telemetry.body_skeleton(raw_bytes, kind) if isinstance(raw_bytes, (bytes, bytearray)) else None
+        size = len(raw_bytes) if isinstance(raw_bytes, (bytes, bytearray)) else None
+        headers = {"content-type": kind}
+        capture = lambda: _json_body(raw_bytes)  # noqa: E731
+    else:
+        # Converse sends its parameters (minus the model id, which is in the
+        # path) as the JSON body.
+        payload = {key: value for key, value in params.items() if key != "modelId"}
+        body = _telemetry.skeleton(payload)
+        size = None
+        headers = {"content-type": "application/json"}
+        capture = lambda: _json_safe(payload)  # noqa: E731
+    return _Call(Provider.BEDROCK.value, url, "POST", headers=headers, body=body,
+                 body_bytes=size, capture=capture)
+
+
 def _bedrock_api_call(original: Any, client: Any, operation_name: str, path: str, api_params: Any) -> Any:
     try:
-        model_id = api_params.get("modelId") if isinstance(api_params, dict) else None
-        endpoint = str(getattr(client.meta, "endpoint_url", "") or "https://bedrock-runtime.amazonaws.com")
-        url = f"{endpoint.rstrip('/')}/model/{quote(str(model_id or ''), safe='')}/{path}"
-        request_body = _bedrock_request_body(operation_name, api_params)
-        call_site = capture_call_site()
-        ctx = {**_state.default_context, **get_context()}
-        capture_body = _state.capture_body
-        streaming = operation_name.endswith("Stream")
-        event_id = uuid.uuid4().hex
-        payload = _admission_payload(event_id, _BEDROCK, url, request_body,
-                                     None, ctx, streaming)
-        payload["model"] = model_id
-        start = time.perf_counter()
+        call = _bedrock_call(client, operation_name, path, api_params)
     except Exception:
         logger.debug("[costkey] bedrock request inspection failed", exc_info=True)
         return original(client, operation_name, api_params)
 
-    admission_decision = _run_admission_sync(payload)
+    call.decision = _run_admission_sync(call.admission_payload())
     try:
         response = original(client, operation_name, api_params)
-    except Exception as exc:
-        status, headers, request_id = _bedrock_response_meta(getattr(exc, "response", None))
-        if status is not None:
-            _process(_BEDROCK, url, "POST", status, request_body, None,
-                     (time.perf_counter() - start) * 1000, streaming, None, call_site, ctx,
-                     event_id=event_id, provider_request_id=request_id,
-                     capture_body=capture_body, usage=None, model=model_id,
-                     response_headers=headers)
-        _settle_sync(admission_decision, None, status, event_id)
+    except BaseException as exc:
+        status, headers = _bedrock_response_meta(getattr(exc, "response", None))
+        error_body = getattr(exc, "response", None)
+        call.finish(
+            status=status, headers=headers,
+            body=_telemetry.skeleton({k: v for k, v in error_body.items() if k != "ResponseMetadata"})
+            if isinstance(error_body, dict) else None,
+            error=exc, responded=status is not None,
+        )
+        _settle_sync(call.decision, call.event_id)
         raise
 
     try:
-        status, headers, request_id = _bedrock_response_meta(response)
-        if streaming:
+        status, headers = _bedrock_response_meta(response)
+        if operation_name.endswith("Stream"):
             key = "stream" if operation_name == "ConverseStream" else "body"
-            recorder = _StreamRecorder(
-                _BEDROCK, url, "POST", request_body, start, call_site, ctx,
-                status_code=status, headers=headers, event_id=event_id,
-                admission_decision=admission_decision, capture_body=capture_body,
-            )
+            recorder = _StreamRecorder(call, status_code=status, headers=headers)
+            recorder.collector.format = "aws-eventstream"
             if response.get(key) is not None:
                 response[key] = _BedrockEventStream(response[key], recorder)
             else:
                 recorder.done()
             return response
 
-        response_body: Any = None
         if operation_name == "InvokeModel":
+            data = None
             raw = response.get("body")
             if raw is not None and hasattr(raw, "read"):
                 data = raw.read()
                 from botocore.response import StreamingBody
                 response["body"] = StreamingBody(io.BytesIO(data), len(data))
-                if "json" in str(response.get("contentType") or "application/json").lower():
-                    try:
-                        response_body = _json_safe(json.loads(data))
-                    except Exception:
-                        response_body = None
+            kind = str(response.get("contentType") or "application/json")
+            call.finish(
+                status=status, headers=headers,
+                body=_telemetry.body_skeleton(data, kind) if data is not None else None,
+                body_bytes=len(data) if data is not None else None,
+                captured_response=_json_body(data) if call.capture_body else None,
+            )
         else:
-            response_body = _json_safe({k: v for k, v in response.items() if k != "ResponseMetadata"})
-        usage = call_usage(_BEDROCK, url, request_body, response_body, headers, status, "POST")
-        _process(_BEDROCK, url, "POST", status, request_body, response_body,
-                 (time.perf_counter() - start) * 1000, False, None, call_site, ctx,
-                 event_id=event_id, provider_request_id=request_id,
-                 capture_body=capture_body, usage=usage, model=model_id,
-                 response_headers=headers)
-        _settle_sync(admission_decision, usage, status, event_id)
+            payload = {k: v for k, v in response.items() if k != "ResponseMetadata"}
+            call.finish(
+                status=status, headers=headers, body=_telemetry.skeleton(payload),
+                captured_response=_json_safe(payload) if call.capture_body else None,
+            )
+        _settle_sync(call.decision, call.event_id)
     except Exception:
         logger.debug("[costkey] bedrock response capture failed", exc_info=True)
     return response
@@ -2360,91 +1941,6 @@ def _unpatch_botocore() -> None:
 
 
 # ── Event processing ──
-
-_UNSET: Any = object()
-
-
-def _process(extractor: Any, url: str, method: str, status_code: int | None,
-             request_body: Any, response_body: Any,
-             duration_ms: float, streaming: bool, stream_timing: StreamTiming | None,
-             call_site: Any, ctx: dict[str, Any], event_id: str | None = None,
-             provider_request_id: str | None = None,
-             capture_body: bool | None = None, *, usage: Any = _UNSET,
-             model: str | None = None, response_headers: Any = None) -> None:
-    try:
-        # LiveKit/session adapters can report a cumulative LLM component at a
-        # different granularity than the underlying HTTP request. Callers may
-        # scope this opt-out around the overlapping provider call and keep the
-        # explicit session usage as the source of charge.
-        if ctx.get("costkeyCapture") in {"manual", "explicit", "disabled"}:
-            return
-        if usage is _UNSET:
-            usage = call_usage(extractor, url, request_body, response_body, response_headers, status_code, method)
-        model = model or call_model(extractor, url, request_body, response_body)
-
-        response_charge_id = provider_request_id
-        if isinstance(response_body, dict):
-            for key in ("id", "request_id", "requestId", "response_id", "responseId"):
-                if isinstance(response_body.get(key), str) and response_body[key]:
-                    response_charge_id = response_body[key]
-                    break
-        request_model = call_model(extractor, url, request_body, None)
-
-        should_capture = _state.capture_body if capture_body is None else capture_body
-        resolved_id = event_id or uuid.uuid4().hex
-        # Calls are stamped when they started: now minus the measured duration.
-        started_at = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(milliseconds=max(duration_ms, 0))
-        attempt_label = ctx.get("attemptId", ctx.get("attempt_id"))
-        parent_event = ctx.get("parentEventId", ctx.get("parent_event_id"))
-        event = CostKeyEvent(
-            id=resolved_id,
-            timestamp=started_at.isoformat(timespec='milliseconds').replace('+00:00', 'Z'),
-            project_id=_state.project_id,
-            provider=extractor.provider,
-            model=model,
-            url=_safe_url(url),
-            method=method,
-            status_code=status_code,
-            usage=usage,
-            cost_usd=usage.cost_usd if usage else None,
-            duration_ms=round(duration_ms, 2),
-            streaming=streaming,
-            stream_timing=stream_timing,
-            call_site=call_site,
-            context=_scrub(ctx),
-            metadata=(
-                _json_safe(_scrub(_extract_metadata(request_body, response_body)))
-                if should_capture
-                else _extract_safe_metadata(request_body, response_body)
-            ),
-            system_prompt=_scrub(_extract_system_prompt(request_body)) if should_capture else None,
-            request_body=_json_safe(_scrub(request_body)) if should_capture else None,
-            response_body=_json_safe(_scrub(response_body)) if should_capture else None,
-            event_type="call",
-            source="auto",
-            trace_id=ctx.get("traceId", ctx.get("trace_id")),
-            trace_name=ctx.get("traceName", ctx.get("trace_name")),
-            group_id=ctx.get("groupId", ctx.get("group_id")),
-            group_name=ctx.get("groupName", ctx.get("group_name")),
-            group_kind=ctx.get("groupKind", ctx.get("group_kind")),
-            execution_id=ctx.get("executionId", ctx.get("execution_id")),
-            phase=ctx.get("phase"),
-            dataset_revision=ctx.get("datasetRevision", ctx.get("dataset_revision")),
-            case_id=ctx.get("caseId", ctx.get("case_id")),
-            configuration=_scrub(ctx.get("configuration")) if isinstance(ctx.get("configuration"), dict) else None,
-            request_model=request_model if request_model != model else None,
-            charge_id=response_charge_id,
-            provider_request_id=response_charge_id,
-            attempt_id=attempt_label if isinstance(attempt_label, str) and attempt_label.strip() else resolved_id,
-            parent_event_id=parent_event if isinstance(parent_event, str) and parent_event.strip() else None,
-            span_id=ctx.get("spanId") if isinstance(ctx.get("spanId"), str) else None,
-        )
-
-        _dispatch_event(event, legacy_hook=True)
-    except Exception:
-        if _state.debug:
-            logger.warning("[costkey] Error processing event", exc_info=True)
-
 
 def _dispatch_event(event: CostKeyEvent, *, legacy_hook: bool = False) -> bool:
     """Apply the appropriate hook and enqueue one event, without leaking errors."""
@@ -2567,11 +2063,21 @@ def emit_lifecycle(
     return event_id
 
 
-_MAX_SPAN_PAYLOAD_CHARS = 2000
+def framework_attributes(framework: str, raw: dict[str, Any] | None) -> dict[str, Any]:
+    """Span attributes for a framework integration: the framework's raw
+    attributes under ``attributes.<framework>``, whole (scrubbed) when body
+    capture is on and as an attribute skeleton when it is off."""
+    values = dict(raw or {})
+    nested = (
+        _json_safe(_scrub(values))
+        if _state.capture_body
+        else _telemetry.attribute_skeleton(values)
+    )
+    return {"framework": framework, framework: nested}
 
 
 def _span_payload(value: Any) -> str | None:
-    """Span input/output are content: bounded, scrubbed, capture-only."""
+    """Span input/output are content: whole, scrubbed, capture-only."""
     if value is None:
         return None
     try:
@@ -2581,7 +2087,7 @@ def _span_payload(value: Any) -> str | None:
     text = _scrub(text)
     if not isinstance(text, str):
         return None
-    return text if len(text) <= _MAX_SPAN_PAYLOAD_CHARS else text[:_MAX_SPAN_PAYLOAD_CHARS] + "…"
+    return text
 
 
 def emit_span(
@@ -2602,6 +2108,7 @@ def emit_span(
     attributes: dict[str, Any] | None = None,
     input: Any = None,
     output: Any = None,
+    call_site: Any = None,
 ) -> None:
     """Enqueue one delivery of an agent/step/tool span (start or end)."""
     attrs = dict(attributes or {})
@@ -2630,39 +2137,10 @@ def emit_span(
         span_name=name,
         span_status=status,
         attributes=_scrub(attrs) if attrs else None,
+        call_site=call_site,
     )
     _dispatch_event(event)
 
-
-def emit_score(
-    *,
-    score_id: str,
-    name: str,
-    value: float,
-    timestamp: str,
-    trace_id: str | None = None,
-    span_id: str | None = None,
-    label: str | None = None,
-    comment: str | None = None,
-    source: str | None = None,
-) -> bool:
-    """Enqueue one judge/human/code score. The comment is content: capture only."""
-    event = CostKeyEvent(
-        id=score_id,
-        timestamp=timestamp,
-        project_id=_state.project_id,
-        provider=Provider.UNKNOWN,
-        event_type="score",
-        # The envelope source carries the score's origin for score events.
-        source=source or "explicit",
-        trace_id=trace_id,
-        span_id=span_id,
-        score_name=name,
-        score_value=value,
-        score_label=label,
-        score_comment=comment if _state.capture_body else None,
-    )
-    return _dispatch_event(event)
 
 
 def get_context() -> dict[str, Any]:
