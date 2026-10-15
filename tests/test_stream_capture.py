@@ -362,3 +362,61 @@ def test_capture_off_sends_no_response_body():
     assert wire(call)["responseBody"] is None
     assert call.telemetry["stream"]["chunkCount"] == 4
     assert "Hel" not in json.dumps(call.telemetry)
+
+
+# ── Streams the app stops reading ──
+
+def _lines_then_stop(module, stop_after: str | None):
+    """Read a Responses stream line by line, stopping after the line that contains ``stop_after``."""
+    body = sse(RESPONSES_EVENTS)
+    with capturing(capture_body=True) as sink:
+        with module.Client(transport=module.MockTransport(_handler(module, body))) as http:
+            with http.stream("POST", "https://api.openai.com/v1/responses",
+                             json={"model": "gpt-5", "input": "hi", "stream": True}) as response:
+                for line in response.iter_lines():
+                    if stop_after and stop_after in line:
+                        break
+    return only_call(sink)
+
+
+@pytest.mark.parametrize("module_name", ["httpx", "httpx2"])
+def test_a_stream_closed_before_its_end_is_reported_as_closed_early(module_name):
+    module = pytest.importorskip(module_name)
+    call = _lines_then_stop(module, '"response.created"')
+    sent = wire(call)
+    # The raw fact, as Python sees it; the server maps it to a cancelled call.
+    assert sent["telemetry"]["error"] == {"name": "GeneratorExit", "code": None}
+    assert call.response_body == {KEY: RESPONSES_EXPECTED[:1]}
+
+
+@pytest.mark.parametrize("module_name", ["httpx", "httpx2"])
+def test_a_stream_closed_right_after_its_last_event_finished(module_name):
+    module = pytest.importorskip(module_name)
+    call = _lines_then_stop(module, '"response.completed"')
+    assert wire(call)["telemetry"]["error"] is None
+    assert call.response_body == {KEY: RESPONSES_EXPECTED}
+
+
+@pytest.mark.parametrize("module_name", ["httpx", "httpx2"])
+def test_a_stream_read_to_the_end_has_no_error(module_name):
+    module = pytest.importorskip(module_name)
+    call = _lines_then_stop(module, None)
+    assert wire(call)["telemetry"]["error"] is None
+
+
+def test_a_closed_early_stream_lasts_until_its_last_data_not_its_cleanup():
+    httpx = pytest.importorskip("httpx")
+    import time as _time
+
+    body = sse(RESPONSES_EVENTS)
+    with capturing(capture_body=True) as sink:
+        http = httpx.Client(transport=httpx.MockTransport(_handler(httpx, body)))
+        response = http.send(http.build_request("POST", "https://api.openai.com/v1/responses",
+                                                json={"model": "gpt-5", "input": "hi", "stream": True}), stream=True)
+        lines = response.iter_lines()
+        next(lines)                       # the app reads one line and moves on
+        _time.sleep(0.3)                  # the connection is cleaned up later
+        lines.close()
+        response.close()
+        http.close()
+    assert wire(only_call(sink))["durationMs"] < 250

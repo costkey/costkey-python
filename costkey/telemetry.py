@@ -536,6 +536,31 @@ def _event_stream_headers(raw: bytes) -> dict[str, Any]:
 STREAM_BODY_KEY = "__costkey_stream__"
 
 
+# Events that end a stream, so one closed right after them still finished.
+_END_TYPES = frozenset({
+    "response.completed", "response.incomplete", "response.failed",  # OpenAI Responses
+    "message_stop",  # Anthropic
+    "error",
+})
+
+
+def _is_end_event(payload: Any) -> bool:
+    """Whether a stream event is a provider's last one."""
+    if not isinstance(payload, dict):
+        return False
+    if payload.get("type") in _END_TYPES or payload.get("done") is True:  # Ollama: done
+        return True
+    if "messageStop" in payload or "metadata" in payload and "usage" in (payload.get("metadata") or {}):  # Bedrock
+        return True
+    for choice in payload.get("choices") or []:  # Chat Completions
+        if isinstance(choice, dict) and choice.get("finish_reason"):
+            return True
+    for candidate in payload.get("candidates") or []:  # Gemini
+        if isinstance(candidate, dict) and candidate.get("finishReason"):
+            return True
+    return False
+
+
 class StreamCollector:
     """Turns a streamed response body into skeleton chunks, incrementally.
 
@@ -566,6 +591,8 @@ class StreamCollector:
         self.bytes = 0
         self.first_ms: float | None = None
         self.last_ms: float | None = None
+        # The provider's last event arrived ([DONE], response.completed, a finish reason...).
+        self.saw_end = False
         self._buffer = bytearray()
         self._data_lines: list[str] = []
         self._event_name: str | None = None
@@ -580,6 +607,8 @@ class StreamCollector:
         self.last_ms = round(now, 2)
 
     def _add(self, payload: Any, *, event: str | None = None, keep: bool = True) -> None:
+        if not self.saw_end and _is_end_event(payload):
+            self.saw_end = True
         chunk = skeleton(payload)
         self.count += 1
         if len(self.head) < MAX_STREAM_CHUNKS:
@@ -648,6 +677,8 @@ class StreamCollector:
             # ``[DONE]`` is framing (the end-of-stream sentinel), not a record.
             if data.strip() != "[DONE]":
                 self._add_text(data, name or None)
+            else:
+                self.saw_end = True
 
     def _ndjson_line(self, line: str) -> None:
         if line.strip():

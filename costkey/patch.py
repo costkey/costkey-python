@@ -800,6 +800,7 @@ class _TeeStreamReader:
         try:
             self._recorder.chunk(data)
             if self._reader.at_eof():
+                self._recorder.exhausted = True
                 self._recorder.done()
         except Exception:
             logger.debug("[costkey] aiohttp stream capture failed", exc_info=True)
@@ -1056,12 +1057,13 @@ class _Call:
     def finish(self, *, status: int | None = None, headers: Any = None, body: Any = None,
                body_bytes: int | None = None, stream: dict[str, Any] | None = None,
                error: BaseException | dict[str, Any] | None = None, responded: bool = True,
-               captured_response: Any = None) -> None:
+               captured_response: Any = None, duration_ms: float | None = None) -> None:
         if self.sent:
             return
         self.sent = True
         try:
-            duration_ms = (time.perf_counter() - self.start) * 1000
+            if duration_ms is None:
+                duration_ms = (time.perf_counter() - self.start) * 1000
             data = _telemetry.build(
                 method=self.method,
                 url=self.url,
@@ -1174,7 +1176,9 @@ class _StreamRecorder:
         # iter_bytes); only the outermost one records.
         self.depth = 0
         self.sent = False
-        self.error: BaseException | None = None
+        # Read to the end (the iterator ran out, or read() returned the body).
+        self.exhausted = False
+        self.error: BaseException | dict[str, Any] | None = None
         self.settlement_task: Any = None
 
     def chunk(self, data: Any) -> None:
@@ -1211,10 +1215,20 @@ class _StreamRecorder:
         self.sent = True
         try:
             stream, body = self.collector.finish()
+            error = self.error
+            duration_ms = None
+            # Closed or dropped before its end: the app stopped reading. That is a
+            # GeneratorExit in Python terms, and it lasted until the last data read,
+            # not until the connection was cleaned up, which can be minutes later.
+            if error is None and not self.exhausted and not self.collector.saw_end:
+                error = {"name": "GeneratorExit", "code": None}
+                if self.collector.last_ms is not None:
+                    duration_ms = self.collector.last_ms
             self.call.finish(
                 status=self.status_code, headers=self.headers, body=body,
-                body_bytes=self.collector.bytes, stream=stream, error=self.error,
+                body_bytes=self.collector.bytes, stream=stream, error=error,
                 captured_response=self.collector.captured_body() if self.call.capture_body else None,
+                duration_ms=duration_ms,
             )
         except Exception:
             logger.debug("[costkey] stream capture failed", exc_info=True)
@@ -1246,6 +1260,8 @@ def _record_iter(recorder: _StreamRecorder, original: Any, record: Callable[[Any
                 if outer:
                     record(item)
                 yield item
+            if outer:
+                recorder.exhausted = True
         except BaseException as exc:
             if outer:
                 recorder.fail(exc)
@@ -1267,6 +1283,8 @@ def _record_aiter(recorder: _StreamRecorder, original: Any, record: Callable[[An
                 if outer:
                     record(item)
                 yield item
+            if outer:
+                recorder.exhausted = True
         except BaseException as exc:
             if outer:
                 recorder.fail(exc)
@@ -1331,6 +1349,7 @@ def _finish_httpx(call: _Call, response: Any, settlement_async: bool) -> _Stream
     if _is_stream_response(headers) or _is_streaming_request_body(call):
         recorder = _StreamRecorder(call, status_code=response.status_code, headers=headers,
                                    settlement_async=settlement_async)
+        recorder.exhausted = True
         recorder.chunk(response.content)
         return recorder
     content = response.content
@@ -1472,6 +1491,7 @@ def _wrap_streaming_response(response: Any, call: _Call, settlement_async: bool 
             finally:
                 recorder.depth -= 1
             if recorder.depth == 0:
+                recorder.exhausted = True
                 recorder.chunk(data)
                 recorder.done()
             return data
@@ -1491,6 +1511,7 @@ def _wrap_streaming_response(response: Any, call: _Call, settlement_async: bool 
             finally:
                 recorder.depth -= 1
             if recorder.depth == 0:
+                recorder.exhausted = True
                 recorder.chunk(data)
                 await recorder.finish_async()
             return data
@@ -1599,6 +1620,7 @@ def _patch_requests() -> None:
                 _wrap_requests_stream(response, recorder)
             elif _is_stream_response(headers) or _is_streaming_request_body(call):
                 recorder = _StreamRecorder(call, status_code=response.status_code, headers=headers)
+                recorder.exhausted = True
                 recorder.chunk(response.content)
                 recorder.done()
             else:
@@ -1795,6 +1817,7 @@ class _BedrockEventStream:
             for event in self._stream:
                 self._recorder.event(event)
                 yield event
+            self._recorder.exhausted = True
         except BaseException as exc:
             self._recorder.fail(exc)
             raise
@@ -1900,6 +1923,7 @@ def _bedrock_api_call(original: Any, client: Any, operation_name: str, path: str
             if response.get(key) is not None:
                 response[key] = _BedrockEventStream(response[key], recorder)
             else:
+                recorder.exhausted = True
                 recorder.done()
             return response
 
