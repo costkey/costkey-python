@@ -425,6 +425,24 @@ costkey.init(
 )
 ```
 
+### Screen capture
+
+For agents that send screenshots to the model (computer-use and browser
+agents), CostKey can upload those images so the console can replay the run.
+It's off unless you turn it on here **and** screen capture is on for the
+project:
+
+```py
+costkey.init(dsn=os.environ["COSTKEY_DSN"], capture_screens=True)
+```
+
+Each image is uploaded once, by the SHA-256 of its bytes, and the call lists
+the images in its request (`event.frames`, newest last). This works without
+body capture. Images over 2 MB are listed but not uploaded. `before_send` can
+remove entries from `event.frames`, and only frames still listed after it
+are uploaded. With the generated `sitecustomize.py`, set
+`COSTKEY_CAPTURE_SCREENS=true`.
+
 ## Providers
 
 Calls to these hosts are captured:

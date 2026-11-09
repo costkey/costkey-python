@@ -310,6 +310,7 @@ def _write_guide(detection: dict[str, object], dsn: str) -> None:
             "        dsn=os.environ.get('COSTKEY_DSN'),\n"
             "        release=os.environ.get('COSTKEY_RELEASE'),\n"
             "        capture_body=(None if 'COSTKEY_CAPTURE_BODY' not in os.environ else os.environ['COSTKEY_CAPTURE_BODY'].lower() != 'false'),\n"
+            "        capture_screens=os.environ.get('COSTKEY_CAPTURE_SCREENS') == 'true',\n"
             "        debug=os.environ.get('COSTKEY_DEBUG') == 'true',\n"
             "    )\n"
         )
