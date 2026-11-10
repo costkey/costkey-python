@@ -23,6 +23,7 @@ from contextvars import ContextVar
 from typing import Any, Callable, Iterator, AsyncIterator
 from urllib.parse import parse_qsl, quote, urlsplit, urlunsplit
 from costkey import telemetry as _telemetry
+from costkey import frames as _frames
 from costkey.types import CostKeyEvent, Provider
 from costkey import providers as _providers
 from costkey.providers import match_provider
@@ -345,6 +346,9 @@ class _PatchState:
         self.project_id: str = ""
         self.capture_body: bool = False
         self.local_capture_body: bool | None = None
+        # Screen capture: the app opts in and the project allows it.
+        self.capture_screens: bool = False
+        self.local_capture_screens: bool = False
         self.config_known: bool = False
         self.config_status: str = "unknown"
         self.redaction_enabled: bool = True
@@ -373,12 +377,14 @@ _lifecycle_sequences: dict[tuple[str, str, str], int] = {}
 def patch(transport: Transport, project_id: str, capture_body: bool | None,
           before_send: Callable | None, default_context: dict[str, Any], debug: bool,
           before_send_event: Callable | None = None, admission: Any = None,
-          admission_mode: str = "monitor") -> None:
+          admission_mode: str = "monitor", capture_screens: bool = False) -> None:
     if _state.patched:
         return
     _state.transport = transport
     _state.project_id = project_id
     _state.local_capture_body = capture_body
+    _state.local_capture_screens = capture_screens is True
+    _state.capture_screens = False
     # Metadata-safe until the project setting is fetched. Explicit local false
     # remains false even when a remote project setting later allows text.
     _state.capture_body = False
@@ -418,6 +424,8 @@ def unpatch() -> None:
     _state.admission_mode = "monitor"
     _state.capture_body = False
     _state.local_capture_body = None
+    _state.capture_screens = False
+    _state.local_capture_screens = False
     _state.config_known = False
     _state.config_status = "unknown"
     _state.redaction_enabled = True
@@ -447,6 +455,7 @@ def apply_runtime_config(config: Any, *, project_id: str | None = None) -> bool:
         return False
     remote_allows_body = mode == "text" and body_enabled is True
     _state.capture_body = _state.local_capture_body is not False and remote_allows_body
+    _state.capture_screens = _state.local_capture_screens and capture.get("screenCaptureEnabled") is True
     _state.redaction_enabled = redaction_enabled
     try:
         from costkey.providers import apply_runtime_hosts
@@ -464,8 +473,9 @@ def _mark_runtime_config(status: str, *, project_id: str | None = None) -> None:
     if project_id is not None and project_id != _state.project_id:
         return
     _state.config_status = status
-    # A revoked/unavailable/invalid config never unlocks body capture.
+    # A revoked/unavailable/invalid config never unlocks body or screen capture.
     _state.capture_body = False
+    _state.capture_screens = False
     _state.config_known = status == "revoked"
     try:
         from costkey.providers import clear_runtime_hosts
@@ -1020,11 +1030,16 @@ class _Call:
         self.ctx = ctx
         self.capture_body = _state.capture_body
         self.captured_request = None
-        if self.capture_body and capture is not None:
+        self.frames: _frames.ExtractedFrames | None = None
+        capture_screens = _state.capture_screens
+        if (self.capture_body or capture_screens) and capture is not None:
             try:
-                self.captured_request = capture()
+                decoded = capture()
             except Exception:
-                self.captured_request = None
+                decoded = None
+            self.captured_request = decoded if self.capture_body else None
+            if capture_screens and decoded is not None:
+                self.frames = _safe_extract_frames(decoded)
         self.event_id = uuid.uuid4().hex
         self.started_at = _telemetry.iso_now()
         self.start = time.perf_counter()
@@ -1108,7 +1123,7 @@ def _emit_call(call: _Call, data: dict[str, Any], status: int | None, duration_m
         streaming=streamed,
         call_site=call.call_site,
         context=_scrub(ctx),
-        request_body=_json_safe(_scrub(call.captured_request)) if capture else None,
+        request_body=_json_safe(_scrub(_frames.name_frames(call.captured_request, call.frames))) if capture else None,
         response_body=_json_safe(_scrub(captured_response)) if capture else None,
         telemetry=data,
         event_type="call",
@@ -1126,8 +1141,18 @@ def _emit_call(call: _Call, data: dict[str, Any], status: int | None, duration_m
         attempt_id=attempt_label if isinstance(attempt_label, str) and attempt_label.strip() else call.event_id,
         parent_event_id=parent_event if isinstance(parent_event, str) and parent_event.strip() else None,
         span_id=ctx.get("spanId") if isinstance(ctx.get("spanId"), str) else None,
+        frames=list(call.frames.refs) if call.frames else None,
     )
-    _dispatch_event(event, legacy_hook=True)
+    _dispatch_event(event, legacy_hook=True, frames=call.frames)
+
+
+def _safe_extract_frames(body: Any) -> _frames.ExtractedFrames | None:
+    """Images in a request; None if anything goes wrong, so a call is never affected."""
+    try:
+        found = _frames.extract_frames(body)
+        return found if found.refs else None
+    except Exception:
+        return None
 
 
 def _json_body(data: Any) -> Any:
@@ -1966,7 +1991,8 @@ def _unpatch_botocore() -> None:
 
 # ── Event processing ──
 
-def _dispatch_event(event: CostKeyEvent, *, legacy_hook: bool = False) -> bool:
+def _dispatch_event(event: CostKeyEvent, *, legacy_hook: bool = False,
+                    frames: _frames.ExtractedFrames | None = None) -> bool:
     """Apply the appropriate hook and enqueue one event, without leaking errors."""
     try:
         hook = _state.before_send if legacy_hook else _state.before_send_event
@@ -1977,8 +2003,19 @@ def _dispatch_event(event: CostKeyEvent, *, legacy_hook: bool = False) -> bool:
                 if close:
                     close()
                 return False
+        if event and frames is None and getattr(event, "frames", None) is not None:
+            # Screen capture was off at request time: no frame list leaves the process.
+            event.frames = None
         if event and _state.transport:
             _state.transport.enqueue(event)
+            # Upload only the frames still listed after the hook, so it can drop them.
+            enqueue_frame = getattr(_state.transport, "enqueue_frame", None)
+            if frames is not None and enqueue_frame is not None and isinstance(event.frames, list):
+                for ref in event.frames:
+                    sha256 = ref.get("sha256") if isinstance(ref, dict) else None
+                    upload = frames.uploads.get(sha256) if isinstance(sha256, str) else None
+                    if upload is not None:
+                        enqueue_frame(sha256, upload[0], upload[1])
             return True
     except Exception:
         if _state.debug:

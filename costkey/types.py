@@ -95,6 +95,9 @@ class CostKeyEvent:
     response_body: Any = None
     # Raw telemetry (contract v1). Present on every captured call.
     telemetry: dict[str, Any] | None = None
+    # Screen capture: images in the request, in order (newest last). Each is
+    # uploaded separately, once, by hash.
+    frames: list[dict[str, Any]] | None = None
     # Additive DevX event envelope fields.  Defaults preserve the legacy
     # provider-call shape and wire compatibility.
     event_type: str = "call"
@@ -149,6 +152,7 @@ class CostKeyEvent:
 class CostKeyOptions:
     dsn: str = ""
     capture_body: bool | None = None
+    capture_screens: bool = False
     before_send: Callable[[CostKeyEvent], CostKeyEvent | None] | None = None
     before_send_event: Callable[[CostKeyEvent], CostKeyEvent | None] | None = None
     max_batch_size: int = 50

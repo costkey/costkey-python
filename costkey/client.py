@@ -253,6 +253,7 @@ def _resolve_policy(
 
 
 def init(dsn: str | None = None, *, capture_body: bool | None = None,
+         capture_screens: bool = False,
          before_send: Callable[[CostKeyEvent], CostKeyEvent | None] | None = None,
          before_send_event: Callable[[CostKeyEvent], CostKeyEvent | None] | None = None,
          max_batch_size: int = 50, flush_interval: float = 5.0,
@@ -282,6 +283,10 @@ def init(dsn: str | None = None, *, capture_body: bool | None = None,
     commit and repository are detected when not given: ``COSTKEY_COMMIT`` /
     ``COSTKEY_REPOSITORY``, then CI and hosting platform variables, then the
     ``.git`` directory above ``project_root`` (or the working directory).
+
+    ``capture_screens=True`` uploads images sent to the model, such as an
+    agent's screenshots, once each, so the console can replay the run. It also
+    needs screen capture turned on for the project.
     """
     global _transport, _initialized
 
@@ -332,6 +337,7 @@ def init(dsn: str | None = None, *, capture_body: bool | None = None,
         before_send_event=before_send_event,
         admission=admission,
         admission_mode=resolved_policy_mode,
+        capture_screens=capture_screens,
     )
 
     _transport.start()

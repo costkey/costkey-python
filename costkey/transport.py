@@ -9,6 +9,7 @@ import json
 import time
 import threading
 import logging
+import re
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 import httpx
@@ -59,6 +60,15 @@ MAX_BATCH_BYTES = 8 * 1024 * 1024
 MAX_RETRIES = 10
 BASE_BACKOFF_S = 2.0
 MAX_BACKOFF_S = 60.0
+#: Frame bytes held for upload; the oldest are dropped past this.
+MAX_FRAME_QUEUE_BYTES = 32 * 1024 * 1024
+#: Hashes remembered as sent, so history images resent on every call upload once.
+SENT_FRAME_MEMORY = 4096
+
+
+def frames_endpoint(events_endpoint: str) -> str:
+    """The frames endpoint next to the events endpoint the DSN names."""
+    return f"{re.sub(r'/api/v1/events/?$', '', events_endpoint)}/api/v1/frames"
 
 
 def _encode(value: Any) -> bytes:
@@ -112,6 +122,12 @@ class Transport:
         self._consecutive_failures = 0
         self._backoff_until = 0.0
         self._connected = False
+        # Screen capture uploads: (sha256, media type, bytes), oldest first.
+        self._frame_queue: list[tuple[str, str, bytes]] = []
+        self._frame_queue_bytes = 0
+        # Hashes queued or sent this process (dicts keep insertion order).
+        self._sent_frames: dict[str, None] = {}
+        self._frames_disabled = False
 
     def start(self) -> None:
         with self._lock:
@@ -152,6 +168,30 @@ class Transport:
             if len(self._queue) >= self._max_batch_size:
                 self._flush_signal.set()
 
+    def enqueue_frame(self, sha256: str, media_type: str, data: bytes) -> None:
+        """Queue an image for upload, once per hash for the life of the process.
+
+        Never sends on the caller's thread; the worker uploads it."""
+        with self._lock:
+            if self._frames_disabled or sha256 in self._sent_frames:
+                return
+            self._remember_frame(sha256)
+            self._frame_queue.append((sha256, media_type, data))
+            self._frame_queue_bytes += len(data)
+            while self._frame_queue_bytes > MAX_FRAME_QUEUE_BYTES and len(self._frame_queue) > 1:
+                dropped = self._frame_queue.pop(0)
+                self._frame_queue_bytes -= len(dropped[2])
+                # Not sent: a later call that resends this image can queue it again.
+                self._sent_frames.pop(dropped[0], None)
+                if self._debug:
+                    logger.warning("[costkey] Frame queue full, dropping oldest frame")
+        self._flush_signal.set()
+
+    def _remember_frame(self, sha256: str) -> None:
+        self._sent_frames[sha256] = None
+        while len(self._sent_frames) > SENT_FRAME_MEMORY:
+            self._sent_frames.pop(next(iter(self._sent_frames)))
+
     def flush(self) -> None:
         self._flush_signal.set()
         # Explicit flush is allowed to block at a caller-owned lifecycle
@@ -159,6 +199,7 @@ class Transport:
         # the queue lock so concurrent provider calls remain independent.
         with self._flush_lock:
             self._flush_available(force=True)
+            self._flush_frames()
 
     def _worker_loop(self) -> None:
         while not self._stop_signal.is_set():
@@ -168,6 +209,7 @@ class Transport:
                 break
             with self._flush_lock:
                 self._flush_available(force=False)
+                self._flush_frames()
 
     def _flush_available(self, *, force: bool) -> None:
         while True:
@@ -288,6 +330,68 @@ class Transport:
                 logger.warning(f"[costkey] Network error, {len(self._queue)} events queued, retry in {self._get_backoff_s():.0f}s: {e}")
         return False
 
+    def _flush_frames(self) -> None:
+        while True:
+            with self._lock:
+                if self._frames_disabled or not self._frame_queue:
+                    return
+                frame = self._frame_queue.pop(0)
+                self._frame_queue_bytes -= len(frame[2])
+            if not self._send_frame(frame):
+                return
+
+    def _send_frame(self, frame: tuple[str, str, bytes]) -> bool:
+        """PUT one frame's bytes. Returns False when the rest of the queue should wait."""
+        sha256, media_type, data = frame
+        try:
+            from costkey.patch import internal_http
+            with internal_http():
+                resp = httpx.put(
+                    f"{frames_endpoint(self._endpoint)}/{sha256}",
+                    content=data,
+                    headers={
+                        "Authorization": f"Bearer {self._auth_key}",
+                        "User-Agent": f"costkey-python/{__version__}",
+                        "Content-Type": media_type,
+                    },
+                    timeout=httpx.Timeout(10, write=max(10.0, len(data) / (256 * 1024))),
+                )
+        except Exception as e:
+            with self._lock:
+                self._sent_frames.pop(sha256, None)
+            if self._debug:
+                logger.warning(f"[costkey] Failed to upload a frame: {e}")
+            return False
+        if resp.is_success:
+            return True
+        if resp.status_code in (404, 405, 501):
+            # The server doesn't take frames yet: stop for this process.
+            self._disable_frames(f"Frame upload isn't supported by this server ({resp.status_code})")
+            return False
+        if resp.status_code in (401, 403):
+            self._disable_frames(f"Frame upload was refused ({resp.status_code})")
+            return False
+        if resp.status_code == 429:
+            # Back at the head; the worker's next tick retries.
+            with self._lock:
+                self._frame_queue.insert(0, frame)
+                self._frame_queue_bytes += len(data)
+            return False
+        # Any other answer drops this frame; a later call that resends it can retry.
+        with self._lock:
+            self._sent_frames.pop(sha256, None)
+        if self._debug:
+            logger.warning(f"[costkey] Frame upload returned {resp.status_code}")
+        return True
+
+    def _disable_frames(self, reason: str) -> None:
+        with self._lock:
+            self._frames_disabled = True
+            self._frame_queue = []
+            self._frame_queue_bytes = 0
+        if self._debug:
+            logger.warning(f"[costkey] {reason}; screen capture is off for this process")
+
     def _requeue(self, batch: list[dict[str, Any]]) -> None:
         with self._lock:
             # Keep the same bounded queue guarantee on failed delivery as on
@@ -345,6 +449,8 @@ class Transport:
         }
         if event.telemetry is not None:
             d["telemetry"] = event.telemetry
+        if event.frames is not None:
+            d["frames"] = event.frames
 
         # Promote standard identity fields so new servers can index them while
         # retaining the legacy context object used by older servers.
