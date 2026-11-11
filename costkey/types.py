@@ -146,6 +146,11 @@ class CostKeyEvent:
     span_name: str | None = None
     span_status: str | None = None
     attributes: dict[str, Any] | None = None
+    # Score events (run_eval): a named pass/fail on a trace.
+    score_name: str | None = None
+    score_value: int | float | None = None
+    score_label: str | None = None
+    score_comment: str | None = None
 
 
 @dataclass

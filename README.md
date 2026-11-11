@@ -443,6 +443,42 @@ remove entries from `event.frames`, and only frames still listed after it
 are uploaded. With the generated `sitecustomize.py`, set
 `COSTKEY_CAPTURE_SCREENS=true`.
 
+For browser agents on Playwright, [`costkey-replay`](https://github.com/costkey/costkey-replay-python)
+records the pages themselves, as video, next to these calls.
+
+## Evals
+
+Label calls Good or Bad into a dataset in the console, then test a new model
+or prompt on them before you switch. `run_eval` runs in your environment,
+with your own keys: CostKey never holds your provider keys. It reads the
+dataset with a personal access token (`COSTKEY_API_TOKEN`, from Settings, MCP
+& coding agents), runs your task on every item in its own trace, scores each
+answer, and reports the run. The console shows the pass rate and what the
+candidate cost next to the original calls.
+
+```py
+import anthropic, costkey
+
+costkey.init()
+client = anthropic.Anthropic()
+
+summary = costkey.run_eval(
+    "checkout clicks",
+    lambda item: client.messages.create(**{**item.input, "model": "claude-haiku-4-5"}),
+    configuration={"model": "claude-haiku-4-5"},
+)
+print(f"{summary.passed} of {summary.scored} passed")
+```
+
+`item.input` is the original request body, with its screenshots put back.
+The default scorer compares computer actions (Anthropic's computer tool and
+OpenAI's `computer_call`): a Good item must take the same action, clicks
+within `tolerance` pixels (40); a Bad item must not repeat it; an item with
+expected text must contain it. Pass `score=lambda item, output: ...` returning
+`costkey.EvalVerdict(passed, reason)` for your own check. Items run
+`concurrency` at a time (2). In async code, use `await costkey.run_eval_async(...)`;
+its task and scorer may be coroutines.
+
 ## Providers
 
 Calls to these hosts are captured:
@@ -470,6 +506,7 @@ config and captures them like any other provider.
 | `costkey.span(name, kind=..., **options)` | A span of any kind |
 | `costkey.start_trace(name=None, trace_id=None)` | Group calls into one trace |
 | `costkey.start_execution(name, kind="batch", execution_id=None)` | Group repeatable work with a fresh invocation ID |
+| `costkey.run_eval(dataset, task, **options)` | Run a task on a labelled dataset and score it (`run_eval_async` for async code) |
 | `costkey.record_usage(...)` | Report external usage exactly as passed (delta or cumulative) |
 | `costkey.record_livekit_usage(update, ...)` | Send a raw LiveKit usage snapshot |
 | `costkey.export_context()` | Export an explicit allowlisted carrier for trusted handoff |

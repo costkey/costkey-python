@@ -29,6 +29,8 @@ logger = logging.getLogger("costkey")
 
 _transport: Transport | None = None
 _initialized = False
+# The CostKey API next to the events endpoint the DSN names (run_eval reads datasets there).
+_api_base: str | None = None
 _trace_scope_owned: ContextVar[bool] = ContextVar("costkey_trace_scope_owned", default=False)
 _execution_scope_owned: ContextVar[bool] = ContextVar("costkey_execution_scope_owned", default=False)
 
@@ -288,7 +290,7 @@ def init(dsn: str | None = None, *, capture_body: bool | None = None,
     agent's screenshots, once each, so the console can replay the run. It also
     needs screen capture turned on for the project.
     """
-    global _transport, _initialized
+    global _transport, _initialized, _api_base
 
     if _initialized:
         if debug:
@@ -342,6 +344,7 @@ def init(dsn: str | None = None, *, capture_body: bool | None = None,
 
     _transport.start()
     _initialized = True
+    _api_base = endpoint.removesuffix("/events")
     start_runtime_config_fetch(
         endpoint.removesuffix("/api/v1/events"),
         auth_key,
@@ -378,13 +381,14 @@ autolog = init
 
 def shutdown() -> None:
     """Flush pending events and restore original HTTP clients."""
-    global _transport, _initialized
+    global _transport, _initialized, _api_base
     if _transport:
         _transport.flush()
         _transport.stop()
         _transport = None
     unpatch()
     _initialized = False
+    _api_base = None
 
 
 def flush() -> None:
