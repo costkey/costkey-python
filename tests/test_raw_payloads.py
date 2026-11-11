@@ -1,3 +1,4 @@
+import pathlib
 """Non-call payloads stay raw: call graph, explicit usage, LiveKit, errors."""
 from __future__ import annotations
 
@@ -227,7 +228,9 @@ def test_removed_apis_are_gone():
         assert not hasattr(costkey, name)
     with pytest.raises(ImportError):
         __import__("costkey.pricing")
-    assert costkey.__version__.startswith("0.7.")
+    # The version sent with every batch is the one being published.
+    pyproject = (pathlib.Path(__file__).resolve().parent.parent / "pyproject.toml").read_text()
+    assert f'version = "{costkey.__version__}"' in pyproject
 
 
 def test_importing_costkey_imports_no_framework():
