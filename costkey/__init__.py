@@ -19,6 +19,15 @@ from costkey.client import (
     SpanHandle,
 )
 from costkey.policy import CostKeyPolicyRefused, PolicyAdmissionOptions, PolicyOptions
+from costkey.evals import (
+    EvalItem,
+    EvalResult,
+    EvalSummary,
+    EvalVerdict,
+    default_eval_score,
+    run_eval,
+    run_eval_async,
+)
 from costkey.livekit import record_livekit_usage, record_livekit_session_usage
 
 from costkey.version import __version__
@@ -40,6 +49,13 @@ __all__ = [
     "step",
     "tool",
     "SpanHandle",
+    "run_eval",
+    "run_eval_async",
+    "default_eval_score",
+    "EvalItem",
+    "EvalVerdict",
+    "EvalResult",
+    "EvalSummary",
     "CostKeyPolicyRefused",
     "PolicyAdmissionOptions",
     "PolicyOptions",
